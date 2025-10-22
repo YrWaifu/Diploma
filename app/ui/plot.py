@@ -74,8 +74,8 @@ class DataPlot(pg.PlotWidget):
         self._curves: dict[int, pg.PlotDataItem] = {}
         self._plots: dict[int, dict] = {}
         self._x_half_range = 10.0
-        self._x_min = -10.0
-        self._x_max = 10.0
+        self._x_min = 0.0
+        self._x_max = 20.0
         self._initialized = False
         self._last_mouse_event_ts = 0.0
 
@@ -105,26 +105,31 @@ class DataPlot(pg.PlotWidget):
 
     def set_x_half_range(self, R: float):
         self._x_half_range = max(0.001, float(R))
-        # Масштабирование вокруг текущего центра видимого диапазона, а не вокруг нуля
-        center = 0.5 * (self._x_min + self._x_max)
-        if not np.isfinite(center):
-            center = 0.0
-        self._x_min = center - self._x_half_range
-        self._x_max = center + self._x_half_range
+        # Всегда держим левую границу в 0 и масштабируем вправо
+        self._x_min = 0.0
+        self._x_max = 2.0 * self._x_half_range
         if self._initialized:
             self._apply_ranges()
             self._replot_all()
         self.sigXHalfRangeChanged.emit(self._x_half_range)
 
     def set_x_range_direct(self, xmin: float, xmax: float):
-        self._x_min = float(xmin)
-        self._x_max = float(xmax)
-        self._x_half_range = max(abs(xmin), abs(xmax))
+        # Левую границу фиксируем в 0; правая — как задано (или чуть больше 0)
+        x0 = max(0.0, float(xmin))
+        x1 = float(xmax)
+        if not np.isfinite(x0) or not np.isfinite(x1):
+            return
+        if x1 <= x0:
+            x1 = x0 + 1.0
+        self._x_min = 0.0 if x0 <= 1e-12 else x0
+        self._x_max = x1
+        self._x_half_range = 0.5 * (self._x_max - self._x_min)
         if self._initialized:
             self._apply_ranges()
             self._replot_all()
 
     def add_or_update_plot(self, idx: int, x_data, y_data, y1: int, y2: int, color):
+        was_empty = len(self._plots) == 0
         self._plots[idx] = dict(x_data=x_data, y_data=y_data, y_top=min(y1, y2), y_bottom=max(y1, y2), color=color)
         if idx not in self._curves:
             self._curves[idx] = self.plot(pen=pg.mkPen(color, width=2), clipToView=True, autoDownsample=True)
@@ -132,6 +137,8 @@ class DataPlot(pg.PlotWidget):
             self._curves[idx].setPen(pg.mkPen(color, width=2))
         if self._initialized:
             self._replot(idx)
+            if was_empty:
+                self.set_x_zero_to_data_max(padding_ratio=0.02)
 
     def update_plot_v_range(self, idx: int, y1: int, y2: int):
         if idx in self._plots:
@@ -195,3 +202,24 @@ class DataPlot(pg.PlotWidget):
         y_data_span = max(1e-9, y_max - y_min)
         ys = y_top + ((y_max - y_arr) / y_data_span) * span
         self._curves[idx].setData(x_data, ys, antialias=False)
+
+    def set_x_zero_to_data_max(self, padding_ratio: float = 0.02):
+        if not self._plots:
+            # если данных нет — дефолт [0; 20]
+            self.set_x_range_direct(0.0, 20.0)
+            return
+        x_maxs = []
+        for p in self._plots.values():
+            x_arr = np.asarray(p['x_data'])
+            if x_arr.size:
+                x_maxs.append(float(np.max(x_arr)))
+        if not x_maxs:
+            self.set_x_range_direct(0.0, 20.0)
+            return
+        xmax = max(x_maxs)
+        if not np.isfinite(xmax):
+            self.set_x_range_direct(0.0, 20.0)
+            return
+        span = max(1e-12, xmax - 0.0)
+        pad_right = span * float(padding_ratio)
+        self.set_x_range_direct(0.0, xmax + pad_right)
