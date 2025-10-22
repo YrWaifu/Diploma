@@ -78,6 +78,7 @@ class DataPlot(pg.PlotWidget):
         self._x_max = 20.0
         self._initialized = False
         self._last_mouse_event_ts = 0.0
+        self._max_points_factor = 2.0  # целим ~2 точки на пиксель
 
         super().__init__(parent=parent, viewBox=self.vb, background="w")
         pg.setConfigOptions(antialias=True)
@@ -196,12 +197,37 @@ class DataPlot(pg.PlotWidget):
         if getattr(y_data, 'size', 0) == 0:
             self._curves[idx].setData([], [])
             return
+        # ограничиваем число точек под текущую ширину вьюпорта
+        vp_w = max(1, int(self.viewport().width()))
+        target_pts = max(500, int(vp_w * self._max_points_factor))
+
+        x_arr = np.asarray(x_data)
         y_arr = np.asarray(y_data)
+        # видимая выборка по X (x отсортирован по времени)
+        try:
+            i0, i1 = int(np.searchsorted(x_arr, self._x_min, side='left')), int(np.searchsorted(x_arr, self._x_max, side='right'))
+        except Exception:
+            i0, i1 = 0, x_arr.size
+        i0 = max(0, min(i0, x_arr.size))
+        i1 = max(i0, min(i1, x_arr.size))
+        if i1 - i0 <= 0:
+            self._curves[idx].setData([], [])
+            return
+
+        x_vis = x_arr[i0:i1]
+        y_vis = y_arr[i0:i1]
+        n_vis = x_vis.size
+        if n_vis > target_pts:
+            stride = int(np.ceil(n_vis / target_pts))
+            x_vis = x_vis[::stride]
+            y_vis = y_vis[::stride]
+
+        # нормализация Y в пиксели панели
         y_min = float(np.min(y_arr))
         y_max = float(np.max(y_arr))
         y_data_span = max(1e-9, y_max - y_min)
-        ys = y_top + ((y_max - y_arr) / y_data_span) * span
-        self._curves[idx].setData(x_data, ys, antialias=False)
+        ys = y_top + ((y_max - y_vis) / y_data_span) * span
+        self._curves[idx].setData(x_vis, ys, antialias=False)
 
     def set_x_zero_to_data_max(self, padding_ratio: float = 0.02):
         if not self._plots:

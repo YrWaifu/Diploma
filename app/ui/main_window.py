@@ -9,6 +9,8 @@ from app.ui.left_panel import DotsCanvas, Stick
 from app.ui.plot import DataPlot
 from app.ui.coords_panel import CoordinatesPanel
 from app.io.readers.xlsx_reader import read_multicolumn_xlsx
+from app.io.readers.csv_reader import read_multicolumn_csv
+from app.io.readers.parquet_reader import read_multicolumn_parquet
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -76,13 +78,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # UI actions
     def load_data(self):
-        filepaths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Выберите XLSX файлы", "", "Excel Files (*.xlsx)")
+        filepaths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Выберите файлы",
+            "",
+            "Data Files (*.xlsx *.csv *.parquet *.parq);;Excel (*.xlsx);;CSV (*.csv);;Parquet (*.parquet *.parq)"
+        )
         if not filepaths:
             return
         imported = 0
         for fpath in filepaths:
             try:
-                ds = read_multicolumn_xlsx(fpath)
+                suffix = Path(fpath).suffix.lower()
+                if suffix == '.xlsx':
+                    ds = read_multicolumn_xlsx(fpath)
+                elif suffix == '.csv':
+                    ds = read_multicolumn_csv(fpath)
+                elif suffix in ('.parquet', '.parq'):
+                    ds = read_multicolumn_parquet(fpath)
+                else:
+                    raise ValueError(f"Неподдерживаемое расширение: {suffix}")
                 file_path = Path(fpath)
                 series_list = []
                 for name, y in ds.series.items():
