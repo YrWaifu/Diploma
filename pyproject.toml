@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "odiploma"
+version = "0.1.0"
+description = "ODiploma demo app split by layers"
+authors = [{name = "You"}]
+requires-python = ">=3.10"
+dependencies = [
+  "PyQt5>=5.15",
+  "pyqtgraph>=0.13",
+  "pandas>=2.0",
+  "openpyxl>=3.1",
+  "numpy>=1.23",
+]
+
+[tool.odiploma]
+entrypoint = "app.app:main"
