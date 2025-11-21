@@ -77,7 +77,10 @@ class DataPlot(pg.PlotWidget):
         self._x_min = 0.0
         self._x_max = 20.0
         self._initialized = False
-        self._last_mouse_event_ts = 0.0
+        # Частота отрисовки линий курсора не ограничивается, чтобы движение было плавным.
+        # Частота обновления координат (emit в панель) ограничена отдельно.
+        self._last_coords_emit_ts = 0.0
+        self._coords_emit_interval = 0.02  # ~50 Гц для вычислений координат
         self._max_points_factor = 1.0  # целим ~1 точку на пиксель
 
         super().__init__(parent=parent, viewBox=self.vb, background="w")
@@ -103,6 +106,11 @@ class DataPlot(pg.PlotWidget):
         self._initialized = True
         self._apply_ranges()
         self._replot_all()
+
+    def set_cursor_sample_rate_hz(self, hz: float):
+        # Задаёт частоту обновления координат (не линий) в Гц
+        f = max(5.0, float(hz))  # защитимся от слишком низких значений
+        self._coords_emit_interval = 1.0 / f
 
     def set_points_per_pixel(self, ppp: float):
         self._max_points_factor = max(0.1, float(ppp))
@@ -174,17 +182,18 @@ class DataPlot(pg.PlotWidget):
         self._plots.clear()
 
     def _on_mouse_moved(self, pos):
-        now = time.monotonic()
-        if now - self._last_mouse_event_ts < 0.012:  # ~80 Гц, троттлинг для плавности
-            return
-        self._last_mouse_event_ts = now
         if self.sceneBoundingRect().contains(pos):
             mouse_point = self.getViewBox().mapSceneToView(pos)
+            # Линии сдвигаем без троттлинга для максимально плавного хода
             self._vLine.setPos(mouse_point.x())
             self._hLine.setPos(mouse_point.y())
             self._vLine.setVisible(True)
             self._hLine.setVisible(True)
-            self.sigCursorMoved.emit(mouse_point.x(), mouse_point.y())
+            # Троттлим только расчёт и отправку координат в панель
+            now = time.monotonic()
+            if now - self._last_coords_emit_ts >= self._coords_emit_interval:
+                self._last_coords_emit_ts = now
+                self.sigCursorMoved.emit(mouse_point.x(), mouse_point.y())
         else:
             self._vLine.setVisible(False)
             self._hLine.setVisible(False)
