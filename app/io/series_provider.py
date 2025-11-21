@@ -23,6 +23,10 @@ class BaseSeriesProvider:
         self._x_memmap_path: Optional[str] = None
         self._x_memmap: Optional[np.memmap] = None
         self._tmpdir: Optional[tempfile.TemporaryDirectory] = None
+        self._y_memmap_paths: dict[str, str] = {}
+        self._y_memmaps: dict[str, np.memmap] = {}
+        self._x_min_max: Optional[tuple[float, float]] = None
+        self._y_min_max: dict[str, tuple[float, float]] = {}
 
     def list_series(self) -> SeriesList:
         if self._x_name is None or self._series_names is None:
@@ -46,6 +50,19 @@ class BaseSeriesProvider:
     def load_y(self, y_name: str, progress=None, total_hint: Optional[int] = None) -> np.ndarray:
         return self._read_y_column(y_name)
 
+    # Hints for UI/logic
+    def is_x_cached(self) -> bool:
+        return self._x_memmap is not None
+
+    def is_y_cached(self, y_name: str) -> bool:
+        return False
+
+    def get_x_min_max(self) -> Optional[tuple[float, float]]:
+        return self._x_min_max
+
+    def get_y_min_max(self, y_name: str) -> Optional[tuple[float, float]]:
+        return self._y_min_max.get(y_name)
+
     def cleanup(self):
         try:
             self._x_memmap = None
@@ -54,6 +71,14 @@ class BaseSeriesProvider:
                     os.remove(self._x_memmap_path)
                 except Exception:
                     pass
+            for p in list(self._y_memmap_paths.values()):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            self._y_memmaps.clear()
+            self._y_memmap_paths.clear()
             if self._tmpdir is not None:
                 try:
                     self._tmpdir.cleanup()
@@ -136,9 +161,22 @@ class CSVSeriesProvider(BaseSeriesProvider):
         tmpdir = self._ensure_tmpdir()
         safe_col = str(col_name).replace(os.sep, "_")
         out_path = os.path.join(tmpdir, f"{self.path.stem}_{safe_col}.dat")
+        # reuse if exists and size matches
+        if os.path.exists(out_path):
+            try:
+                mm_r = np.memmap(out_path, dtype="float64", mode="r", shape=(total,))
+                return out_path, mm_r
+            except Exception:
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
         mm = np.memmap(out_path, dtype="float64", mode="w+", shape=(total,))
         # pass 2: fill memmap
         offset = 0
+        has_minmax = False
+        cur_min = np.inf
+        cur_max = -np.inf
         for chunk in pd.read_csv(self.path, usecols=[col_name], sep=None, engine="python",
                                  encoding=enc, chunksize=chunksize, dtype=str):
             if self._cancel_requested:
@@ -158,9 +196,26 @@ class CSVSeriesProvider(BaseSeriesProvider):
                     progress(offset, total, f"{col_name}")
                 except Exception:
                     pass
+            # update min/max без предупреждений на "все NaN"
+            if n > 0:
+                valid = np.isfinite(arr)
+                if np.any(valid):
+                    cmin = float(np.min(arr[valid]))
+                    cmax = float(np.max(arr[valid]))
+                    if not has_minmax:
+                        cur_min, cur_max = cmin, cmax
+                        has_minmax = True
+                    else:
+                        cur_min = min(cur_min, cmin)
+                        cur_max = max(cur_max, cmax)
         del mm  # flush to disk
         mm_r = np.memmap(out_path, dtype="float64", mode="r", shape=(total,))
         self._cancel_requested = False
+        if has_minmax:
+            if str(col_name) == (self._x_name or ""):
+                self._x_min_max = (cur_min, cur_max)
+            else:
+                self._y_min_max[str(col_name)] = (cur_min, cur_max)
         return out_path, mm_r
 
     def ensure_x_loaded(self, progress=None, total_hint: Optional[int] = None) -> np.ndarray:
@@ -176,11 +231,18 @@ class CSVSeriesProvider(BaseSeriesProvider):
 
     def load_y(self, y_name: str, progress=None, total_hint: Optional[int] = None) -> np.ndarray:
         # всегда возвращаем memmap, чтобы не распухала RAM
+        if y_name in self._y_memmaps:
+            return self._y_memmaps[y_name]
         total = int(total_hint) if total_hint else (len(self._x_memmap) if self._x_memmap is not None else 0)
         if total <= 0:
             total = self.estimate_rows(self._x_name or None)
-        _, mm = self._stream_column_to_memmap(y_name, progress=progress, total_rows=total)
+        path, mm = self._stream_column_to_memmap(y_name, progress=progress, total_rows=total)
+        self._y_memmap_paths[y_name] = path
+        self._y_memmaps[y_name] = mm
         return mm
+
+    def is_y_cached(self, y_name: str) -> bool:
+        return y_name in self._y_memmaps
 
     def _resolve_read_params(self):
         if self._encoding is not None and self._x_name is not None and self._series_names is not None:

@@ -142,14 +142,15 @@ class DataPlot(pg.PlotWidget):
             self._apply_ranges()
             self._replot_all()
 
-    def add_or_update_plot(self, idx: int, x_data, y_data, y1: int, y2: int, color):
+    def add_or_update_plot(self, idx: int, x_data, y_data, y1: int, y2: int, color, y_min: float | None = None, y_max: float | None = None):
         was_empty = len(self._plots) == 0
         # Кэшируем глобальные min/max для ускорения реплота на больших массивах
-        try:
-            y_min = float(np.min(y_data)) if getattr(y_data, 'size', 0) else 0.0
-            y_max = float(np.max(y_data)) if getattr(y_data, 'size', 0) else 1.0
-        except Exception:
-            y_min, y_max = 0.0, 1.0
+        if y_min is None or y_max is None:
+            try:
+                y_min = float(np.min(y_data)) if getattr(y_data, 'size', 0) else 0.0
+                y_max = float(np.max(y_data)) if getattr(y_data, 'size', 0) else 1.0
+            except Exception:
+                y_min, y_max = 0.0, 1.0
         self._plots[idx] = dict(
             x_data=x_data,
             y_data=y_data,
