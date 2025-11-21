@@ -46,15 +46,25 @@ class CoordinatesPanel(QtWidgets.QWidget):
         y_data = data['y_data']
         if len(x_data) == 0:
             return None
-        # интерполяция ближайшего значения (векторизовано)
+        # быстрая интерполяция по ближайшим двум точкам (O(log N) через searchsorted)
         try:
             x_arr = np.asarray(x_data)
             y_arr = np.asarray(y_data)
-            return float(np.interp(self._cursor_x, x_arr, y_arr))
+            i = int(np.searchsorted(x_arr, self._cursor_x, side='left'))
+            if i <= 0:
+                return float(y_arr[0])
+            if i >= x_arr.size:
+                return float(y_arr[-1])
+            x0 = float(x_arr[i - 1]); x1 = float(x_arr[i])
+            y0 = float(y_arr[i - 1]); y1 = float(y_arr[i])
+            if x1 == x0:
+                return y0
+            t = (self._cursor_x - x0) / (x1 - x0)
+            return float(y0 + t * (y1 - y0))
         except Exception:
-            # fallback на поиск ближайшей точки
-            idx_closest = min(range(len(x_data)), key=lambda i: abs(x_data[i] - self._cursor_x))
-            return y_data[idx_closest]
+            # fallback на ближайшую точку
+            idx_closest = min(range(len(x_data)), key=lambda j: abs(x_data[j] - self._cursor_x))
+            return float(y_data[idx_closest])
 
     def paintEvent(self, event):
         super().paintEvent(event)

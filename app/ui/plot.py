@@ -78,7 +78,7 @@ class DataPlot(pg.PlotWidget):
         self._x_max = 20.0
         self._initialized = False
         self._last_mouse_event_ts = 0.0
-        self._max_points_factor = 2.0  # целим ~2 точки на пиксель
+        self._max_points_factor = 1.0  # целим ~1 точку на пиксель
 
         super().__init__(parent=parent, viewBox=self.vb, background="w")
         pg.setConfigOptions(antialias=True)
@@ -103,6 +103,11 @@ class DataPlot(pg.PlotWidget):
         self._initialized = True
         self._apply_ranges()
         self._replot_all()
+
+    def set_points_per_pixel(self, ppp: float):
+        self._max_points_factor = max(0.1, float(ppp))
+        if self._initialized:
+            self._replot_all()
 
     def set_x_half_range(self, R: float):
         self._x_half_range = max(0.001, float(R))
@@ -131,7 +136,21 @@ class DataPlot(pg.PlotWidget):
 
     def add_or_update_plot(self, idx: int, x_data, y_data, y1: int, y2: int, color):
         was_empty = len(self._plots) == 0
-        self._plots[idx] = dict(x_data=x_data, y_data=y_data, y_top=min(y1, y2), y_bottom=max(y1, y2), color=color)
+        # Кэшируем глобальные min/max для ускорения реплота на больших массивах
+        try:
+            y_min = float(np.min(y_data)) if getattr(y_data, 'size', 0) else 0.0
+            y_max = float(np.max(y_data)) if getattr(y_data, 'size', 0) else 1.0
+        except Exception:
+            y_min, y_max = 0.0, 1.0
+        self._plots[idx] = dict(
+            x_data=x_data,
+            y_data=y_data,
+            y_top=min(y1, y2),
+            y_bottom=max(y1, y2),
+            color=color,
+            y_data_min=y_min,
+            y_data_max=y_max,
+        )
         if idx not in self._curves:
             self._curves[idx] = self.plot(pen=pg.mkPen(color, width=2), clipToView=True, autoDownsample=True)
         else:
@@ -199,7 +218,7 @@ class DataPlot(pg.PlotWidget):
             return
         # ограничиваем число точек под текущую ширину вьюпорта
         vp_w = max(1, int(self.viewport().width()))
-        target_pts = max(500, int(vp_w * self._max_points_factor))
+        target_pts = max(1, int(vp_w * self._max_points_factor))
 
         x_arr = np.asarray(x_data)
         y_arr = np.asarray(y_data)
@@ -223,8 +242,8 @@ class DataPlot(pg.PlotWidget):
             y_vis = y_vis[::stride]
 
         # нормализация Y в пиксели панели
-        y_min = float(np.min(y_arr))
-        y_max = float(np.max(y_arr))
+        y_min = float(plot_data.get('y_data_min', np.min(y_arr)))
+        y_max = float(plot_data.get('y_data_max', np.max(y_arr)))
         y_data_span = max(1e-9, y_max - y_min)
         ys = y_top + ((y_max - y_vis) / y_data_span) * span
         self._curves[idx].setData(x_vis, ys, antialias=False)
