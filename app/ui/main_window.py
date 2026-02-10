@@ -56,6 +56,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._load_mode = getattr(self, "_load_mode", "lazy")  # "lazy" | "preload_all"
         self._init_menu()
+        self._init_chart_toolbar()
 
         self.left.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.left.customContextMenuRequested.connect(lambda pos: self._show_plot_context_menu(self.left, pos))
@@ -82,6 +83,30 @@ class MainWindow(QtWidgets.QMainWindow):
         ]:
             action = calc_menu.addAction(name)
             action.triggered.connect(lambda _checked=False, n=name: self._open_calculation_dialog(n))
+
+    def _init_chart_toolbar(self):
+        """Панель с кнопками управления графиками справа (рядом с Файл/Расчеты)."""
+        toolbar = QtWidgets.QToolBar(self)
+        toolbar.setMovable(False)
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        toolbar.addWidget(spacer)
+        btn_zoom_in = QtWidgets.QPushButton("+")
+        btn_zoom_in.setToolTip("Приблизить (уменьшить диапазон по X)")
+        btn_zoom_in.setFixedSize(32, 24)
+        btn_zoom_out = QtWidgets.QPushButton("−")
+        btn_zoom_out.setToolTip("Отдалить (увеличить диапазон по X)")
+        btn_zoom_out.setFixedSize(32, 24)
+        btn_reset = QtWidgets.QPushButton("Сброс")
+        btn_reset.setToolTip("Сбросить вид: левая граница 0, правая — максимум по всем графикам")
+        btn_reset.setFixedHeight(24)
+        toolbar.addWidget(btn_zoom_in)
+        toolbar.addWidget(btn_zoom_out)
+        toolbar.addWidget(btn_reset)
+        btn_zoom_in.clicked.connect(self._zoom_in_charts)
+        btn_zoom_out.clicked.connect(self._zoom_out_charts)
+        btn_reset.clicked.connect(self._reset_charts_view)
+        self.addToolBar(toolbar)
 
     def _show_plot_context_menu(self, widget: QtWidgets.QWidget, pos: QtCore.QPoint):
         menu = QtWidgets.QMenu(self)
@@ -326,29 +351,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _finalize_added_series(self, desc: Dict, x_data, y_data):
         file_path: Path = desc['file']
-        # ???????? min/max ??? ?????? ???????? ? RAM: ?????????? ??? ?????????? ??? ??????? ???????
-        provider = self._providers.get(file_path)
+        # Диапазон Y всегда считаем по реальным данным, чтобы шкала слева и график совпадали.
+        # Провайдер (get_y_min_max) может не заполнять диапазон (XLSX/Parquet) или давать неточность.
         data_min, data_max = 0.0, 1.0
-        if provider is not None:
-            mm = getattr(provider, "get_y_min_max", None)
-            if callable(mm):
-                pair = provider.get_y_min_max(desc['name'])
-                if pair is not None:
-                    data_min, data_max = float(pair[0]), float(pair[1])
-        if data_max == data_min or not np.isfinite(data_min) or not np.isfinite(data_max):
-            # fallback: ??????? ?????? ?? ??????????
-            try:
-                y_arr = np.asarray(y_data)
-                n = y_arr.size
-                if n > 0:
-                    stride = max(1, n // 100000)  # ?? 100k ?????
-                    s = y_arr[::stride]
-                    data_min = float(np.nanmin(s))
-                    data_max = float(np.nanmax(s))
-                    if not np.isfinite(data_min) or not np.isfinite(data_max) or data_min == data_max:
-                        data_min, data_max = 0.0, 1.0
-            except Exception:
-                data_min, data_max = 0.0, 1.0
+        try:
+            y_arr = np.asarray(y_data)
+            n = y_arr.size
+            if n > 0:
+                stride = max(1, n // 100000)
+                s = y_arr[::stride]
+                data_min = float(np.nanmin(s))
+                data_max = float(np.nanmax(s))
+                if not np.isfinite(data_min) or not np.isfinite(data_max):
+                    data_min, data_max = 0.0, 1.0
+                elif data_min == data_max:
+                    data_min, data_max = data_min - 0.5, data_min + 0.5
+        except Exception:
+            data_min, data_max = 0.0, 1.0
         idx = self.left.stick_count()
         hue = (idx * 47) % 360
         color = QtGui.QColor.fromHsv(hue, 220, 220)
@@ -402,6 +421,20 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self._memory_mru.clear()
+
+    def _zoom_in_charts(self):
+        """Приблизить: уменьшить видимый диапазон по X."""
+        current_range = self.right._x_half_range
+        self.right.set_x_half_range(current_range / 1.5)
+
+    def _zoom_out_charts(self):
+        """Отдалить: увеличить видимый диапазон по X."""
+        current_range = self.right._x_half_range
+        self.right.set_x_half_range(current_range * 1.5)
+
+    def _reset_charts_view(self):
+        """Сброс: левая граница 0, правая — максимум среди всех графиков (с небольшим отступом)."""
+        self.right.set_x_zero_to_data_max(padding_ratio=0.02)
 
     def zoom_out_right_panel(self):
         current_range = self.right._x_half_range
