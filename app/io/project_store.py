@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Сохранение и загрузка проекта (workspace).
-Формат: JSON с расширением .odproj. В файле только состояние: пути к файлам,
+Формат: JSON с расширением .secsig. В файле только состояние: пути к файлам,
 какие ряды добавлены на графики, геометрия стиков и вид по X. Данные при открытии
 подгружаются заново из исходных файлов.
 """
@@ -12,7 +12,7 @@ from typing import Any
 
 
 PROJECT_VERSION = 1
-PROJECT_EXT = ".odproj"
+PROJECT_EXT = ".secsig"
 
 
 def _path_to_str(p: Path) -> str:
@@ -25,7 +25,7 @@ def save_project(state: dict[str, Any], path: Path) -> None:
     Сохраняет состояние проекта в JSON-файл.
 
     state: словарь с ключами version, sources, plots, view (см. структуру ниже).
-    path: путь к файлу (обычно с расширением .odproj).
+    path: путь к файлу (обычно с расширением .secsig).
     """
     path = Path(path)
     if path.suffix.lower() != PROJECT_EXT:

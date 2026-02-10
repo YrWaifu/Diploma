@@ -53,10 +53,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._max_memory_series: int = 7
         # для сохранения проекта: idx -> (path, series_name)
         self._plot_index_to_source: Dict[int, tuple] = {}
-        # ?????? ???????? (??? "?????????")
+        # путь текущего проекта (для «Сохранить»)
         self._project_path: Path | None = None
+        # проект изменён после последнего сохранения (для подтверждения при закрытии)
+        self._project_dirty: bool = False
 
-        # ????????? ??????????? ????????? (????? ????????, ????????? ????? ? ?.?.)
+        # загрузка пользовательских настроек
         self._load_user_settings()
 
         self.left.stickUpdated.connect(self.on_stick_updated)
@@ -82,8 +84,10 @@ class MainWindow(QtWidgets.QMainWindow):
         open_action = file_menu.addAction("Открыть")
         open_action.triggered.connect(self.load_data)
         save_action = file_menu.addAction("Сохранить")
+        save_action.setShortcut(QtGui.QKeySequence.Save)  # Ctrl+S
         save_action.triggered.connect(self._save_project)
         save_as_action = file_menu.addAction("Сохранить как...")
+        save_as_action.setShortcut(QtGui.QKeySequence("Ctrl+Shift+S"))
         save_as_action.triggered.connect(self._save_project_as)
         export_action = file_menu.addAction("Экспорт")
         export_action.triggered.connect(self._export_results)
@@ -313,26 +317,30 @@ class MainWindow(QtWidgets.QMainWindow):
             elif getattr(self.right, "_plots", {}):
                 self.right.set_x_zero_to_data_max(padding_ratio=0.02)
 
-    def _save_project(self):
+    def _save_project(self) -> bool:
+        """Сохраняет проект. Возвращает True, если сохранение выполнено (или не требовалось)."""
         if self._project_path is not None and self._project_path.exists():
             state = self.get_project_state()
             try:
                 save_project(state, self._project_path)
                 self.setWindowTitle(f"ODiploma — {self._project_path.name}")
+                self._project_dirty = False
+                return True
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "Ошибка сохранения", str(e))
-            return
-        self._save_project_as()
+                return False
+        return self._save_project_as()
 
-    def _save_project_as(self):
+    def _save_project_as(self) -> bool:
+        """Сохранить как... Возвращает True, если файл сохранён."""
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Сохранить проект",
             "",
-            f"ODiploma проект (*{PROJECT_EXT});;Все файлы (*.*)",
+            "Все файлы (*.*);;Проект SecSig (*.secsig)",
         )
         if not path:
-            return
+            return False
         path = Path(path)
         if path.suffix.lower() != PROJECT_EXT:
             path = path.with_suffix(PROJECT_EXT)
@@ -341,8 +349,11 @@ class MainWindow(QtWidgets.QMainWindow):
             save_project(state, path)
             self._project_path = path
             self.setWindowTitle(f"ODiploma — {path.name}")
+            self._project_dirty = False
+            return True
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Ошибка сохранения", str(e))
+            return False
 
     def _export_results(self):
         QtWidgets.QMessageBox.information(self, "Экспорт", "Экспорт пока не реализован.")
@@ -361,6 +372,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plot_tmp_paths.clear()
         self._plotted_keys.clear()
         self._memory_mru.clear()
+        self._project_dirty = True
 
     # UI actions
     def load_data(self):
@@ -368,18 +380,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             "Выберите файлы или проект",
             "",
-            f"ODiploma проект (*{PROJECT_EXT});;Данные (*.xlsx *.csv *.parquet *.parq);;Excel (*.xlsx);;CSV (*.csv);;Parquet (*.parquet *.parq);;Все файлы (*.*)"
+            "Все файлы (*.*);;Проект SecSig (*.secsig);;Данные (*.xlsx *.csv *.parquet *.parq);;Excel (*.xlsx);;CSV (*.csv);;Parquet (*.parquet *.parq)",
         )
         if not filepaths:
             return
 
-        # Один файл .odproj — открыть проект
+        # Один файл .secsig — открыть проект
         if len(filepaths) == 1 and is_project_file(Path(filepaths[0])):
             path = Path(filepaths[0])
             try:
                 state = load_project(path)
                 self.apply_project_state(state)
                 self._project_path = path
+                self._project_dirty = False
                 self.setWindowTitle(f"ODiploma — {path.name}")
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "Ошибка открытия проекта", str(e))
@@ -444,6 +457,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         if imported:
+            self._project_dirty = True
             QtWidgets.QMessageBox.information(
                 self,
                 "Импорт завершён",
@@ -618,6 +632,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.coords.update_stick_data(idx_added, color, data_min, data_max, y1, y2, x_data, y_data)
         self._plotted_keys.add(desc['key'])
         self._plot_index_to_source[idx_added] = (file_path, desc['name'])
+        self._project_dirty = True
         # путь к memmap для уже выгруженных на диск рядов
         try:
             import numpy as _np
@@ -654,6 +669,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self._memory_mru.clear()
+        self._project_dirty = True
 
     def _zoom_in_charts(self):
         """Приблизить: уменьшить видимый диапазон по X."""
@@ -730,7 +746,21 @@ class MainWindow(QtWidgets.QMainWindow):
             pdialog.close()
 
     def closeEvent(self, event):
-        # ?????? ??????? ????? ?????????
+        if self._project_dirty:
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Подтверждение",
+                "Проект изменён. Сохранить изменения перед закрытием?",
+                QtWidgets.QMessageBox.Save | QtWidgets.QMessageBox.Discard | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Save,
+            )
+            if reply == QtWidgets.QMessageBox.Cancel:
+                event.ignore()
+                return
+            if reply == QtWidgets.QMessageBox.Save:
+                if not self._save_project():
+                    event.ignore()
+                    return
         try:
             self._save_user_settings()
             self.clear_all()

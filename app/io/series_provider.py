@@ -2,8 +2,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional
-import tempfile
+import gc
 import os
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -65,24 +66,28 @@ class BaseSeriesProvider:
 
     def cleanup(self):
         try:
+            # Сбрасываем ссылки на memmap, чтобы ОС освободила файлы (на Windows иначе PermissionError при удалении)
             self._x_memmap = None
+            self._y_memmaps.clear()
+            gc.collect()
+
             if self._x_memmap_path and os.path.exists(self._x_memmap_path):
                 try:
                     os.remove(self._x_memmap_path)
-                except Exception:
+                except OSError:
                     pass
             for p in list(self._y_memmap_paths.values()):
                 try:
                     if os.path.exists(p):
                         os.remove(p)
-                except Exception:
+                except OSError:
                     pass
-            self._y_memmaps.clear()
             self._y_memmap_paths.clear()
+
             if self._tmpdir is not None:
                 try:
                     self._tmpdir.cleanup()
-                except Exception:
+                except OSError:
                     pass
         finally:
             self._x_memmap_path = None
