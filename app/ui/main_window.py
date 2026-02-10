@@ -11,7 +11,13 @@ from app.ui.left_panel import DotsCanvas, Stick
 from app.ui.plot import DataPlot
 from app.ui.coords_panel import CoordinatesPanel
 from app.io.series_provider import make_series_provider
-from app.processing import compute_strain_characteristics, StrainResult
+from app.processing import (
+    compute_strain_characteristics,
+    StrainResult,
+    compute_vibrometry,
+    VibrometryResult,
+    estimate_fs_from_time,
+)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -154,6 +160,8 @@ class MainWindow(QtWidgets.QMainWindow):
         plots = self._get_active_plots()
         if title == "Тензометрирование (прочность)":
             dlg = TensometryDialog(plots, self)
+        elif title == "Виброметрирование (вибрации)":
+            dlg = VibrometryDialog(plots, self)
         else:
             dlg = CalculationDialog(title, plots, self)
         dlg.exec_()
@@ -919,6 +927,212 @@ class TensometryDialog(QtWidgets.QDialog):
             "",
         ]
         self._results_text.append("\n".join(block))
+
+    def _on_batch_finished(self, message: str):
+        self._progress.setValue(100)
+        self._progress.setVisible(False)
+        self._calc_btn.setEnabled(True)
+        self._worker_thread = None
+        self._worker = None
+
+
+class VibrometryBatchWorker(QtCore.QObject):
+    """Воркер: список (метка, x, y), полоса f1–f2, длина сегмента → по одному VibrometryResult на график."""
+    progress = QtCore.pyqtSignal(int)
+    one_result = QtCore.pyqtSignal(str, object)  # label, VibrometryResult
+    finished = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        items: list,
+        band_f1_hz: float | None = None,
+        band_f2_hz: float | None = None,
+        segment_length: int | None = None,
+    ):
+        super().__init__()
+        self._items = list(items)  # [(label, x_array, y_array), ...]
+        self._band_f1 = float(band_f1_hz) if band_f1_hz is not None else None
+        self._band_f2 = float(band_f2_hz) if band_f2_hz is not None else None
+        self._segment_length = int(segment_length) if segment_length and segment_length >= 4 else None
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        n = len(self._items)
+        for i, (label, x_arr, y_arr) in enumerate(self._items):
+            x = np.asarray(x_arr, dtype=float)
+            y = np.asarray(y_arr, dtype=float)
+            fs = estimate_fs_from_time(x)
+            if not np.isfinite(fs) or fs <= 0:
+                fs = 1000.0
+            r = compute_vibrometry(
+                y,
+                fs_hz=fs,
+                band_f1_hz=self._band_f1,
+                band_f2_hz=self._band_f2,
+                segment_length=self._segment_length,
+            )
+            self.one_result.emit(label, r)
+            self.progress.emit(int((i + 1) * 100 / n) if n else 100)
+        self.finished.emit("Расчет завершен.")
+
+
+class VibrometryDialog(QtWidgets.QDialog):
+    """Одно окно: выбор графиков (галочки), полоса частот, кнопка «Рассчитать», блок результатов."""
+
+    def __init__(self, plots: list[tuple[int, str]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Виброметрирование (вибрации)")
+        self.resize(540, 600)
+        self._plots = plots
+        self._worker_thread = None
+        self._worker = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # --- Графики для анализа ---
+        grp_graphs = QtWidgets.QGroupBox("Графики для анализа")
+        grp_graphs_lay = QtWidgets.QVBoxLayout(grp_graphs)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_select_all = QtWidgets.QPushButton("Выбрать все")
+        btn_select_none = QtWidgets.QPushButton("Снять все")
+        btn_select_all.clicked.connect(self._check_all_graphs)
+        btn_select_none.clicked.connect(self._uncheck_all_graphs)
+        btn_row.addWidget(btn_select_all)
+        btn_row.addWidget(btn_select_none)
+        btn_row.addStretch(1)
+        grp_graphs_lay.addLayout(btn_row)
+        self._graph_list = QtWidgets.QListWidget()
+        self._graph_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        for idx, label in plots:
+            item = QtWidgets.QListWidgetItem(label)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Unchecked)
+            item.setData(QtCore.Qt.UserRole, idx)
+            self._graph_list.addItem(item)
+        if not plots:
+            self._graph_list.addItem(QtWidgets.QListWidgetItem("Нет активных графиков"))
+        grp_graphs_lay.addWidget(self._graph_list)
+        layout.addWidget(grp_graphs)
+
+        # --- Параметры ---
+        grp_params = QtWidgets.QGroupBox("Параметры")
+        params_lay = QtWidgets.QFormLayout(grp_params)
+        self._f1_spin = QtWidgets.QDoubleSpinBox()
+        self._f1_spin.setRange(0.0, 1e6)
+        self._f1_spin.setValue(0.0)
+        self._f1_spin.setDecimals(2)
+        self._f1_spin.setSuffix(" Гц")
+        self._f2_spin = QtWidgets.QDoubleSpinBox()
+        self._f2_spin.setRange(0.0, 1e6)
+        self._f2_spin.setValue(1000.0)
+        self._f2_spin.setDecimals(2)
+        self._f2_spin.setSuffix(" Гц")
+        self._use_band_cb = QtWidgets.QCheckBox("СКЗ в полосе частот (по PSD Уэлча)")
+        self._use_band_cb.setChecked(True)
+        params_lay.addRow("Полоса частот f₁:", self._f1_spin)
+        params_lay.addRow("Полоса частот f₂:", self._f2_spin)
+        params_lay.addRow("", self._use_band_cb)
+        layout.addWidget(grp_params)
+
+        # --- Рассчитать ---
+        self._progress = QtWidgets.QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setVisible(False)
+        self._calc_btn = QtWidgets.QPushButton("Рассчитать")
+        self._calc_btn.clicked.connect(self._run_calculation)
+        layout.addWidget(self._progress)
+        layout.addWidget(self._calc_btn)
+
+        # --- Результаты ---
+        grp_results = QtWidgets.QGroupBox("Результаты")
+        results_lay = QtWidgets.QVBoxLayout(grp_results)
+        self._results_text = QtWidgets.QTextEdit()
+        self._results_text.setReadOnly(True)
+        self._results_text.setPlaceholderText(
+            "Выберите графики, при необходимости задайте полосу частот и нажмите «Рассчитать»."
+        )
+        self._results_text.setMinimumHeight(220)
+        results_lay.addWidget(self._results_text)
+        layout.addWidget(grp_results)
+
+        btn_close = QtWidgets.QPushButton("Закрыть")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+    def _check_all_graphs(self):
+        for i in range(self._graph_list.count()):
+            item = self._graph_list.item(i)
+            if item.data(QtCore.Qt.UserRole) is not None:
+                item.setCheckState(QtCore.Qt.Checked)
+
+    def _uncheck_all_graphs(self):
+        for i in range(self._graph_list.count()):
+            self._graph_list.item(i).setCheckState(QtCore.Qt.Unchecked)
+
+    def _run_calculation(self):
+        main_win = self.parent()
+        if not main_win or not hasattr(main_win, "get_plot_series_data"):
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Нет доступа к данным графика.")
+            return
+        checked = []
+        for i in range(self._graph_list.count()):
+            item = self._graph_list.item(i)
+            idx = item.data(QtCore.Qt.UserRole)
+            if idx is None:
+                continue
+            if item.flags() & QtCore.Qt.ItemIsUserCheckable and item.checkState() == QtCore.Qt.Checked:
+                label = item.text()
+                data = main_win.get_plot_series_data(idx)
+                if data is not None:
+                    x_data, y_data = data
+                    checked.append((label, x_data, y_data))
+        if not checked:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Нет выбранных графиков с данными.")
+            return
+
+        band_f1 = self._f1_spin.value() if self._use_band_cb.isChecked() else None
+        band_f2 = self._f2_spin.value() if self._use_band_cb.isChecked() else None
+        if self._use_band_cb.isChecked() and (band_f2 <= band_f1):
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Полоса частот: f₂ должна быть больше f₁.")
+            return
+
+        self._results_text.clear()
+        self._progress.setVisible(True)
+        self._progress.setValue(0)
+        self._calc_btn.setEnabled(False)
+
+        self._worker_thread = QtCore.QThread(self)
+        self._worker = VibrometryBatchWorker(
+            checked,
+            band_f1_hz=band_f1,
+            band_f2_hz=band_f2,
+        )
+        self._worker.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._progress.setValue)
+        self._worker.one_result.connect(self._append_result)
+        self._worker.finished.connect(self._on_batch_finished)
+        self._worker.finished.connect(self._worker_thread.quit)
+        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker_thread.start()
+
+    def _append_result(self, label: str, r: VibrometryResult):
+        t = r.time
+        lines = [
+            f"——— {label} ———",
+            f"  Частота дискретизации: {r.fs_hz:.2f} Гц, отсчётов: {r.n_samples}",
+            "  Временные характеристики:",
+            f"    Среднее (μ): {t.mean:.6g}",
+            f"    СКЗ (x_rms): {t.rms:.6g}",
+            f"    Пик (max |x₀|): {t.peak:.6g}",
+            f"    Пик-пик: {t.peak_to_peak:.6g}",
+            f"    Пик-фактор (CF): {t.crest_factor:.6g}",
+        ]
+        if r.rms_in_band is not None and r.band_f1_hz is not None and r.band_f2_hz is not None:
+            lines.append(f"  СКЗ в полосе [{r.band_f1_hz:.2f}, {r.band_f2_hz:.2f}] Гц: {r.rms_in_band:.6g}")
+        lines.append("")
+        self._results_text.append("\n".join(lines))
 
     def _on_batch_finished(self, message: str):
         self._progress.setValue(100)
