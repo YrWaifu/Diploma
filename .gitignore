@@ -3,3 +3,4 @@
 *.xslx
 venv
 *__pycache__*
+.coverage

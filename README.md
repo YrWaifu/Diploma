@@ -2,7 +2,20 @@
 
 # Как запустить?
 ```bash
+pip install -r requirements.txt -r requirements-dev.txt
+
 python -m app.app
+```
+# Запустить тесты
+```bash
+pytest tests/ -v
+# or
+pytest tests/
+```
+
+# Посмотреть покрытие
+```bash
+pip install -r requirements-dev.txt
 ```
 
 # Цели архитектуры
