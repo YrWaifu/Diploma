@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 import numpy as np
@@ -11,6 +11,7 @@ from app.ui.left_panel import DotsCanvas, Stick
 from app.ui.plot import DataPlot
 from app.ui.coords_panel import CoordinatesPanel
 from app.io.series_provider import make_series_provider
+from app.io.project_store import save_project, load_project, is_project_file, PROJECT_EXT
 from app.processing import (
     compute_strain_characteristics,
     StrainResult,
@@ -50,6 +51,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plot_tmp_paths: Dict[int, str] = {}
         # ????? RAM-???????? (????? ???? ????????????? ???????????)
         self._max_memory_series: int = 7
+        # для сохранения проекта: idx -> (path, series_name)
+        self._plot_index_to_source: Dict[int, tuple] = {}
+        # ?????? ???????? (??? "?????????")
+        self._project_path: Path | None = None
 
         # ????????? ??????????? ????????? (????? ????????, ????????? ????? ? ?.?.)
         self._load_user_settings()
@@ -78,6 +83,8 @@ class MainWindow(QtWidgets.QMainWindow):
         open_action.triggered.connect(self.load_data)
         save_action = file_menu.addAction("Сохранить")
         save_action.triggered.connect(self._save_project)
+        save_as_action = file_menu.addAction("Сохранить как...")
+        save_as_action.triggered.connect(self._save_project_as)
         export_action = file_menu.addAction("Экспорт")
         export_action.triggered.connect(self._export_results)
 
@@ -166,8 +173,176 @@ class MainWindow(QtWidgets.QMainWindow):
             dlg = CalculationDialog(title, plots, self)
         dlg.exec_()
 
+    def get_project_state(self) -> Dict[str, Any]:
+        """Состояние проекта для сохранения: источники, графики (путь + ряд + стик), вид по X."""
+        sources = []
+        seen = set()
+        for entry in self._datasets:
+            p = entry["path"]
+            path_str = str(p.resolve())
+            if path_str not in seen:
+                seen.add(path_str)
+                sources.append({"path": path_str})
+
+        plots = []
+        for idx in sorted(getattr(self.right, "_plots", {}).keys()):
+            src = self._plot_index_to_source.get(idx)
+            if not src:
+                continue
+            path, series_name = src
+            stick = self.left.get_stick(idx)
+            if not stick:
+                continue
+            color_hex = stick.color.name() if stick.color else "#2d5ac8"
+            if not color_hex.startswith("#"):
+                color_hex = "#2d5ac8"
+            plots.append({
+                "source_path": str(Path(path).resolve()),
+                "series_name": series_name,
+                "stick": {
+                    "x": stick.x,
+                    "y1": stick.y1,
+                    "y2": stick.y2,
+                    "color_hex": color_hex,
+                    "data_min": stick.data_min,
+                    "data_max": stick.data_max,
+                },
+            })
+
+        view = {}
+        if hasattr(self.right, "_x_min") and hasattr(self.right, "_x_max"):
+            view = {"x_min": float(self.right._x_min), "x_max": float(self.right._x_max)}
+
+        return {"version": 1, "sources": sources, "plots": plots, "view": view}
+
+    def apply_project_state(self, state: Dict[str, Any]) -> None:
+        """Восстанавливает workspace из сохранённого состояния. Данные подгружаются из файлов."""
+        self.clear_all()
+        sources = state.get("sources", [])
+        plots = state.get("plots", [])
+        if not sources and not plots:
+            return
+
+        # Регистрируем источники (провайдеры + список рядов в _datasets)
+        for s in sources:
+            path_str = s.get("path", "")
+            if not path_str:
+                continue
+            file_path = Path(path_str)
+            if not file_path.exists():
+                QtWidgets.QMessageBox.warning(
+                    self, "Файл не найден",
+                    f"Файл источника не найден:\n{file_path}\nРяды из него не будут восстановлены."
+                )
+                continue
+            try:
+                provider = make_series_provider(file_path)
+                info = provider.list_series()
+                self._providers[file_path] = provider
+                series_list = [
+                    {"key": f"{file_path}|{name}", "file": file_path, "name": name}
+                    for name in info.y_names
+                ]
+                self._datasets.append({"path": file_path, "series": series_list, "x_name": info.x_name})
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(
+                    self, "Ошибка загрузки источника",
+                    f"Не удалось открыть файл:\n{file_path}\n\n{e}"
+                )
+
+        if not plots:
+            view = state.get("view", {})
+            if view:
+                x_min = view.get("x_min")
+                x_max = view.get("x_max")
+                if x_min is not None and x_max is not None and hasattr(self.right, "set_x_range_direct"):
+                    self.right.set_x_range_direct(float(x_min), float(x_max))
+            return
+
+        # Восстанавливаем графики по порядку: загрузка данных и добавление с сохранённой геометрией стика
+        progress_dlg = QtWidgets.QProgressDialog("Восстановление проекта...", "Отмена", 0, len(plots), self)
+        progress_dlg.setWindowTitle("Открытие проекта")
+        progress_dlg.setMinimumDuration(300)
+        progress_dlg.setWindowModality(QtCore.Qt.ApplicationModal)
+
+        for i, plot in enumerate(plots):
+            progress_dlg.setValue(i)
+            progress_dlg.setLabelText(f"Загрузка ряда {i + 1}/{len(plots)}...")
+            QtWidgets.QApplication.processEvents()
+            if progress_dlg.wasCanceled():
+                break
+
+            path_str = plot.get("source_path", "")
+            series_name = plot.get("series_name", "")
+            stick_override = plot.get("stick")
+            file_path = Path(path_str)
+
+            desc = None
+            for entry in self._datasets:
+                if entry["path"] == file_path:
+                    for s in entry["series"]:
+                        if s["name"] == series_name:
+                            desc = s
+                            break
+                    break
+            if not desc:
+                continue
+
+            provider = self._providers.get(file_path)
+            if not provider:
+                continue
+            try:
+                x_data = provider.ensure_x_loaded()
+                y_data = provider.load_y(series_name)
+                self._finalize_added_series(desc, x_data, y_data, stick_override=stick_override)
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(
+                    self, "Ошибка",
+                    f"Не удалось загрузить ряд «{series_name}» из {file_path.name}\n\n{e}"
+                )
+
+        progress_dlg.setValue(len(plots))
+        progress_dlg.close()
+
+        view = state.get("view", {})
+        if view and hasattr(self.right, "set_x_range_direct"):
+            x_min = view.get("x_min")
+            x_max = view.get("x_max")
+            if x_min is not None and x_max is not None:
+                self.right.set_x_range_direct(float(x_min), float(x_max))
+            elif getattr(self.right, "_plots", {}):
+                self.right.set_x_zero_to_data_max(padding_ratio=0.02)
+
     def _save_project(self):
-        QtWidgets.QMessageBox.information(self, "Сохранить", "Сохранение проекта пока не реализовано.")
+        if self._project_path is not None and self._project_path.exists():
+            state = self.get_project_state()
+            try:
+                save_project(state, self._project_path)
+                self.setWindowTitle(f"ODiploma — {self._project_path.name}")
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "Ошибка сохранения", str(e))
+            return
+        self._save_project_as()
+
+    def _save_project_as(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Сохранить проект",
+            "",
+            f"ODiploma проект (*{PROJECT_EXT});;Все файлы (*.*)",
+        )
+        if not path:
+            return
+        path = Path(path)
+        if path.suffix.lower() != PROJECT_EXT:
+            path = path.with_suffix(PROJECT_EXT)
+        state = self.get_project_state()
+        try:
+            save_project(state, path)
+            self._project_path = path
+            self.setWindowTitle(f"ODiploma — {path.name}")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Ошибка сохранения", str(e))
 
     def _export_results(self):
         QtWidgets.QMessageBox.information(self, "Экспорт", "Экспорт пока не реализован.")
@@ -176,6 +351,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.left.clear_all()
         self.right.clear_all()
         self.coords.clear_all()
+        self._plot_index_to_source.clear()
         for p in list(self._plot_tmp_paths.values()):
             try:
                 if Path(p).exists():
@@ -190,12 +366,27 @@ class MainWindow(QtWidgets.QMainWindow):
     def load_data(self):
         filepaths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
-            "Выберите файлы",
+            "Выберите файлы или проект",
             "",
-            "Data Files (*.xlsx *.csv *.parquet *.parq);;Excel (*.xlsx);;CSV (*.csv);;Parquet (*.parquet *.parq)"
+            f"ODiploma проект (*{PROJECT_EXT});;Данные (*.xlsx *.csv *.parquet *.parq);;Excel (*.xlsx);;CSV (*.csv);;Parquet (*.parquet *.parq);;Все файлы (*.*)"
         )
         if not filepaths:
             return
+
+        # Один файл .odproj — открыть проект
+        if len(filepaths) == 1 and is_project_file(Path(filepaths[0])):
+            path = Path(filepaths[0])
+            try:
+                state = load_project(path)
+                self.apply_project_state(state)
+                self._project_path = path
+                self.setWindowTitle(f"ODiploma — {path.name}")
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "Ошибка открытия проекта", str(e))
+            return
+
+        # Импорт данных: сбрасываем путь проекта (сохранение будет «Сохранить как»)
+        self._project_path = None
         imported = 0
         was_canceled = False
         new_file_paths: List[Path] = []
@@ -379,35 +570,46 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.finished.connect(on_finished)
         thread.start()
 
-    def _finalize_added_series(self, desc: Dict, x_data, y_data):
+    def _finalize_added_series(self, desc: Dict, x_data, y_data, stick_override: Optional[Dict[str, Any]] = None):
         file_path: Path = desc['file']
-        # Диапазон Y всегда считаем по реальным данным, чтобы шкала слева и график совпадали.
-        # Провайдер (get_y_min_max) может не заполнять диапазон (XLSX/Parquet) или давать неточность.
+        # Диапазон Y по реальным данным (или из stick_override при восстановлении проекта).
         data_min, data_max = 0.0, 1.0
-        try:
-            y_arr = np.asarray(y_data)
-            n = y_arr.size
-            if n > 0:
-                stride = max(1, n // 100000)
-                s = y_arr[::stride]
-                data_min = float(np.nanmin(s))
-                data_max = float(np.nanmax(s))
-                if not np.isfinite(data_min) or not np.isfinite(data_max):
-                    data_min, data_max = 0.0, 1.0
-                elif data_min == data_max:
-                    data_min, data_max = data_min - 0.5, data_min + 0.5
-        except Exception:
-            data_min, data_max = 0.0, 1.0
-        idx = self.left.stick_count()
-        hue = (idx * 47) % 360
-        color = QtGui.QColor.fromHsv(hue, 220, 220)
+        if stick_override:
+            data_min = float(stick_override.get("data_min", 0.0))
+            data_max = float(stick_override.get("data_max", 1.0))
+        else:
+            try:
+                y_arr = np.asarray(y_data)
+                n = y_arr.size
+                if n > 0:
+                    stride = max(1, n // 100000)
+                    s = y_arr[::stride]
+                    data_min = float(np.nanmin(s))
+                    data_max = float(np.nanmax(s))
+                    if not np.isfinite(data_min) or not np.isfinite(data_max):
+                        data_min, data_max = 0.0, 1.0
+                    elif data_min == data_max:
+                        data_min, data_max = data_min - 0.5, data_min + 0.5
+            except Exception:
+                data_min, data_max = 0.0, 1.0
 
-        # ????????? ????? ??????
-        h = self.left.height(); margin = self.left.margin
-        stick_h = max(100, h - margin * 2 - 100)
-        y1 = int((h - stick_h) / 2); y2 = int(y1 + stick_h)
-        avail_w = max(1, self.left.width() - margin * 2 - 60)
-        x = int(margin + 30 + (idx * 40) % max(1, avail_w))
+        if stick_override:
+            x = int(stick_override.get("x", 50))
+            y1 = int(stick_override.get("y1", 50))
+            y2 = int(stick_override.get("y2", 350))
+            hex_color = stick_override.get("color_hex", "#2d5ac8")
+            color = QtGui.QColor(hex_color) if hex_color.startswith("#") else QtGui.QColor(hex_color)
+            if not color.isValid():
+                color = QtGui.QColor.fromHsv((self.left.stick_count() * 47) % 360, 220, 220)
+        else:
+            idx = self.left.stick_count()
+            hue = (idx * 47) % 360
+            color = QtGui.QColor.fromHsv(hue, 220, 220)
+            h = self.left.height(); margin = self.left.margin
+            stick_h = max(100, h - margin * 2 - 100)
+            y1 = int((h - stick_h) / 2); y2 = int(y1 + stick_h)
+            avail_w = max(1, self.left.width() - margin * 2 - 60)
+            x = int(margin + 30 + (idx * 40) % max(1, avail_w))
 
         new_stick = Stick(x, y1, y2, color, data_min, data_max)
         idx_added = self.left.add_stick(new_stick)
@@ -415,7 +617,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.right.add_or_update_plot(idx_added, x_data, y_data, y1, y2, color, y_min=data_min, y_max=data_max)
         self.coords.update_stick_data(idx_added, color, data_min, data_max, y1, y2, x_data, y_data)
         self._plotted_keys.add(desc['key'])
-        # ???? ??? ??? ??? memmap ? ????? ???? ??? ?????????? ???????
+        self._plot_index_to_source[idx_added] = (file_path, desc['name'])
+        # путь к memmap для уже выгруженных на диск рядов
         try:
             import numpy as _np
             if isinstance(y_data, _np.memmap):
@@ -444,7 +647,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self._plot_tmp_paths.clear()
-        # ?????? X-??????? ???????????
+        self._plot_index_to_source.clear()
         for prov in list(self._providers.values()):
             try:
                 prov.cleanup()

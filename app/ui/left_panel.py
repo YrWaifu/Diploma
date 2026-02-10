@@ -51,6 +51,12 @@ class DotsCanvas(QtWidgets.QWidget):
         self.update()
         return len(self._sticks) - 1
 
+    def get_stick(self, idx: int) -> Optional[Stick]:
+        """Возвращает стик по индексу или None."""
+        if 0 <= idx < len(self._sticks):
+            return self._sticks[idx]
+        return None
+
     def clear_all(self) -> None:
         self._sticks.clear()
         self._draft_stick = None
