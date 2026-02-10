@@ -5,6 +5,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 import numpy as np
 import tempfile
+import time
 
 from app.ui.left_panel import DotsCanvas, Stick
 from app.ui.plot import DataPlot
@@ -15,7 +16,7 @@ from app.io.series_provider import make_series_provider
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ODiploma — правая панель на pyqtgraph, всё быстро и по делу")
+        self.setWindowTitle("ODiploma")
         self.resize(1400, 700)
 
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
@@ -26,24 +27,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.right = DataPlot()
         self.coords = CoordinatesPanel()
 
-        # Настройки пользователя
+        # ????????? ????????????
         self._settings = QtCore.QSettings("ODiploma", "ODiploma")
 
-        # Хранилище импортированных данных (без отрисовки)
-        # self._datasets: список словарей { 'path': Path, 'series': List[descriptor] }
+        # ????????? ??????????????? ?????? (??? ?????????)
+        # self._datasets: ?????? ???????? { 'path': Path, 'series': List[descriptor] }
         # descriptor: { 'key': str, 'file': Path, 'name': str, 'x': np.ndarray, 'y': np.ndarray }
         self._datasets: List[Dict] = []
         self._plotted_keys: set[str] = set()
-        # Провайдеры ленивой загрузки по файлам
+        # ?????????? ??????? ???????? ?? ??????
         self._providers: Dict[Path, object] = {}
-        # MRU-порядок графиков, которые хранят Y в RAM (индексы слева-направо: старые->новые)
+        # MRU-??????? ????????, ??????? ?????? Y ? RAM (??????? ?????-???????: ??????->?????)
         self._memory_mru: List[int] = []
-        # Временные файлы для пониженных в memmap графиков: idx -> (y_tmp_path)
+        # ????????? ????? ??? ?????????? ? memmap ????????: idx -> (y_tmp_path)
         self._plot_tmp_paths: Dict[int, str] = {}
-        # Порог RAM-графиков (может быть переопределён настройками)
+        # ????? RAM-???????? (????? ???? ????????????? ???????????)
         self._max_memory_series: int = 7
 
-        # Применяем сохранённые настройки (режим загрузки, плотность точек и т.п.)
+        # ????????? ??????????? ????????? (????? ????????, ????????? ????? ? ?.?.)
         self._load_user_settings()
 
         self.left.stickUpdated.connect(self.on_stick_updated)
@@ -53,57 +54,82 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.right, 4)
         layout.addWidget(self.coords, 1)
 
-        toolbar = QtWidgets.QToolBar(); toolbar.setMovable(False)
-        self.addToolBar(QtCore.Qt.TopToolBarArea, toolbar)
-
-        clear_action = QtWidgets.QAction("Очистить", self)
-        clear_action.triggered.connect(self.clear_all)
-        toolbar.addAction(clear_action)
-
-        load_action = QtWidgets.QAction("Загрузить XLSX", self)
-        load_action.triggered.connect(self.load_data)
-        toolbar.addAction(load_action)
-
-        add_plot_action = QtWidgets.QAction("Добавить график…", self)
-        add_plot_action.setToolTip("Выбрать и добавить один из загруженных рядов")
-        add_plot_action.triggered.connect(self.add_plot_dialog)
-        toolbar.addAction(add_plot_action)
-
-        reset_x_action = QtWidgets.QAction("Сброс X", self)
-        reset_x_action.setToolTip("Сбросить масштаб по X к дефолту")
-        reset_x_action.triggered.connect(lambda: self.right.set_x_half_range(10.0))
-        toolbar.addAction(reset_x_action)
-
-        zoom_out_action = QtWidgets.QAction("Отдалить", self)
-        zoom_out_action.setToolTip("Увеличить диапазон по X (отдалить)")
-        zoom_out_action.triggered.connect(self.zoom_out_right_panel)
-        toolbar.addAction(zoom_out_action)
-
-        self._xhalf_spin = QtWidgets.QDoubleSpinBox()
-        self._xhalf_spin.setRange(0.001, 1e9); self._xhalf_spin.setDecimals(3); self._xhalf_spin.setValue(10.0)
-        self._xhalf_spin.valueChanged.connect(lambda v: self.right.set_x_half_range(v))
-        self.right.sigXHalfRangeChanged.connect(self._xhalf_spin.setValue)
-        toolbar.addSeparator(); toolbar.addWidget(QtWidgets.QLabel("Полудиапазон X:")); toolbar.addWidget(self._xhalf_spin)
-
-        hint = QtWidgets.QLabel("ЛКМ: выделить по X для увеличения. Колесо: масштаб. ПКМ: меню pyqtgraph.")
-        hint.setStyleSheet("color: #666;")
-        toolbar.addSeparator(); toolbar.addWidget(hint)
-
-        # Кнопка "Оптимизация" с меню
         self._load_mode = getattr(self, "_load_mode", "lazy")  # "lazy" | "preload_all"
-        opt_btn = QtWidgets.QToolButton(self)
-        opt_btn.setText("Оптимизация")
-        # Клик по тексту сразу открывает меню; убираем индикатор-стрелку
-        opt_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-        opt_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
-        opt_btn.setStyleSheet("QToolButton::menu-indicator { image: none; }")
-        opt_menu = QtWidgets.QMenu(opt_btn)
-        act_mode = opt_menu.addAction("Режим загрузки…")
-        act_mode.triggered.connect(self._show_optimization_mode_dialog)
-        act_preload = opt_menu.addAction("Предзагрузить все серии сейчас")
-        act_preload.triggered.connect(self._preload_all_series)
-        opt_btn.setMenu(opt_menu)
-        toolbar.addSeparator(); toolbar.addWidget(opt_btn)
+        self._init_menu()
+
+        self.left.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.left.customContextMenuRequested.connect(lambda pos: self._show_plot_context_menu(self.left, pos))
+        self.right.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.right.customContextMenuRequested.connect(lambda pos: self._show_plot_context_menu(self.right, pos))
+
+
+    def _init_menu(self):
+        menu = self.menuBar()
+        file_menu = menu.addMenu("Файл")
+        open_action = file_menu.addAction("Открыть")
+        open_action.triggered.connect(self.load_data)
+        save_action = file_menu.addAction("Сохранить")
+        save_action.triggered.connect(self._save_project)
+        export_action = file_menu.addAction("Экспорт")
+        export_action.triggered.connect(self._export_results)
+
+        calc_menu = menu.addMenu("Расчеты")
+        for name in [
+            "Выгрузить и отобразить",
+            "Калькулятор",
+            "Тензометрирование (прочность)",
+            "Виброметрирование (вибрации)",
+        ]:
+            action = calc_menu.addAction(name)
+            action.triggered.connect(lambda _checked=False, n=name: self._open_calculation_dialog(n))
+
+    def _show_plot_context_menu(self, widget: QtWidgets.QWidget, pos: QtCore.QPoint):
+        menu = QtWidgets.QMenu(self)
+        add_action = menu.addAction("Добавить график")
+        add_action.triggered.connect(self.add_plot_dialog)
+        clear_action = menu.addAction("Очистить")
+        clear_action.triggered.connect(self.clear_plots_only)
+        if not self._has_available_series():
+            add_action.setEnabled(False)
+        menu.exec_(widget.mapToGlobal(pos))
+
+    def _has_available_series(self) -> bool:
+        for entry in self._datasets:
+            for desc in entry['series']:
+                if desc['key'] not in self._plotted_keys:
+                    return True
+        return False
+
+    def _get_active_plots(self) -> list[tuple[int, str]]:
+        plots = []
+        if hasattr(self.right, "_plots"):
+            for order, idx in enumerate(sorted(self.right._plots.keys())):
+                plots.append((idx, f"График {order + 1}"))
+        return plots
+
+    def _open_calculation_dialog(self, title: str):
+        dlg = CalculationDialog(title, self._get_active_plots(), self)
+        dlg.exec_()
+
+    def _save_project(self):
+        QtWidgets.QMessageBox.information(self, "Сохранить", "Сохранение проекта пока не реализовано.")
+
+    def _export_results(self):
+        QtWidgets.QMessageBox.information(self, "Экспорт", "Экспорт пока не реализован.")
+
+    def clear_plots_only(self):
+        self.left.clear_all()
+        self.right.clear_all()
+        self.coords.clear_all()
+        for p in list(self._plot_tmp_paths.values()):
+            try:
+                if Path(p).exists():
+                    Path(p).unlink()
+            except Exception:
+                pass
+        self._plot_tmp_paths.clear()
+        self._plotted_keys.clear()
+        self._memory_mru.clear()
 
     # UI actions
     def load_data(self):
@@ -118,12 +144,12 @@ class MainWindow(QtWidgets.QMainWindow):
         imported = 0
         was_canceled = False
         new_file_paths: List[Path] = []
-        # В режиме предзагрузки НЕ показываем общий прогресс заголовков,
+        # В режиме предзагрузки не показываем общий прогресс заголовков,
         # чтобы не дублировать с детальным прогрессом по файлу
         use_headers_progress = self._load_mode != "preload_all"
         progress = None
         if use_headers_progress:
-            progress = QtWidgets.QProgressDialog("Чтение заголовков…", "Отмена", 0, len(filepaths), self)
+            progress = QtWidgets.QProgressDialog("Чтение заголовков...", "Отмена", 0, len(filepaths), self)
             progress.setWindowTitle("Импорт файлов")
             progress.setWindowModality(QtCore.Qt.ApplicationModal)
             progress.setMinimumDuration(300)
@@ -151,7 +177,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._datasets.append({'path': file_path, 'series': series_list, 'x_name': info.x_name})
                 new_file_paths.append(file_path)
                 imported += len(info.y_names)
-                # если включён режим предзагрузки — подготовим X и все Y сразу
+                # Если включён режим предзагрузки — подготовим X и все Y сразу
                 if self._load_mode == "preload_all":
                     # Покажем только детальный прогресс на файл (без общего)
                     canceled = self._preload_provider_series(file_path, provider, series_list, None, 0)
@@ -172,10 +198,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         if imported:
-            QtWidgets.QMessageBox.information(self, "Импорт завершён", f"Загружено рядов: {imported}. Теперь вы можете добавить их через ‘Добавить график…’")
+            QtWidgets.QMessageBox.information(
+                self,
+                "Импорт завершён",
+                f"Загружено рядов: {imported}. Теперь вы можете добавить их через 'Добавить график…'"
+            )
 
     def add_plot_dialog(self):
-        # подготовка списка доступных, ещё не добавленных рядов
+        # Подготовка списка доступных, ещё не добавленных рядов
         available = []
         for entry in self._datasets:
             for desc in entry['series']:
@@ -183,7 +213,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     available.append(desc)
 
         if not available:
-            QtWidgets.QMessageBox.information(self, "Нет доступных рядов", "Сначала загрузите XLSX, или все ряды уже добавлены.")
+            QtWidgets.QMessageBox.information(self, "Нет доступных рядов", "Сначала загрузите файлы, или все ряды уже добавлены.")
             return
 
         items = [f"{Path(d['file']).name} — {d['name']}" for d in available]
@@ -210,12 +240,12 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         # Запускаем загрузку X/Y в фоновом потоке, чтобы не блокировать GUI
-        progress_dlg = QtWidgets.QProgressDialog("Подготовка ряда…", "Отмена", 0, 0, self)
+        progress_dlg = QtWidgets.QProgressDialog("Подготовка ряда...", "Отмена", 0, 0, self)
         progress_dlg.setWindowTitle("Загрузка ряда")
         progress_dlg.setWindowModality(QtCore.Qt.ApplicationModal)
         progress_dlg.setMinimumDuration(200)
         progress_dlg.setAutoClose(True)
-        progress_dlg.setLabelText(f"Подготовка «{desc['name']}»…")
+        progress_dlg.setLabelText(f"Подготовка «{desc['name']}»...")
 
         class LoadSeriesWorker(QtCore.QObject):
             finished = QtCore.pyqtSignal(object, object, object)  # x, y, err
@@ -228,7 +258,7 @@ class MainWindow(QtWidgets.QMainWindow):
             @QtCore.pyqtSlot()
             def run(self):
                 try:
-                    # оценим строки, чтобы показать точный прогресс
+                    # Оценим строки, чтобы показать точный прогресс
                     total_rows = None
                     try:
                         # для CSV есть estimate_rows
@@ -242,19 +272,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     except Exception:
                         total_rows = None
                     if total_rows and total_rows > 0:
-                        self.setRange.emit(total_rows * 2, "Подготовка X…")
+                        self.setRange.emit(total_rows * 2, "Подготовка X...")
                     # колбэки прогресса
                     base = 0
                     def progress_x(done, total, _label):
                         try:
-                            self.setValue.emit(min(done, total) if total else done, "Подготовка X…")
+                            self.setValue.emit(min(done, total) if total else done, "Подготовка X...")
                         except Exception:
                             pass
                     x_local = self.provider_obj.ensure_x_loaded(progress=progress_x, total_hint=total_rows)
                     base = int(total_rows) if total_rows else len(x_local) if hasattr(x_local, "__len__") else 0
                     def progress_y(done, total, _label):
                         try:
-                            self.setValue.emit(base + (min(done, total) if total else done), f"Чтение «{self.yname}»…")
+                            self.setValue.emit(base + (min(done, total) if total else done), f"Чтение «{self.yname}»...")
                         except Exception:
                             pass
                     y_local = self.provider_obj.load_y(self.yname, progress=progress_y, total_hint=total_rows)
@@ -296,7 +326,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _finalize_added_series(self, desc: Dict, x_data, y_data):
         file_path: Path = desc['file']
-        # Получаем min/max без полной загрузки в RAM: используем кэш провайдера или быструю выборку
+        # ???????? min/max ??? ?????? ???????? ? RAM: ?????????? ??? ?????????? ??? ??????? ???????
         provider = self._providers.get(file_path)
         data_min, data_max = 0.0, 1.0
         if provider is not None:
@@ -306,12 +336,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 if pair is not None:
                     data_min, data_max = float(pair[0]), float(pair[1])
         if data_max == data_min or not np.isfinite(data_min) or not np.isfinite(data_max):
-            # fallback: быстрая оценка по подвыборке
+            # fallback: ??????? ?????? ?? ??????????
             try:
                 y_arr = np.asarray(y_data)
                 n = y_arr.size
                 if n > 0:
-                    stride = max(1, n // 100000)  # до 100k точек
+                    stride = max(1, n // 100000)  # ?? 100k ?????
                     s = y_arr[::stride]
                     data_min = float(np.nanmin(s))
                     data_max = float(np.nanmax(s))
@@ -323,7 +353,7 @@ class MainWindow(QtWidgets.QMainWindow):
         hue = (idx * 47) % 360
         color = QtGui.QColor.fromHsv(hue, 220, 220)
 
-        # геометрия левой панели
+        # ????????? ????? ??????
         h = self.left.height(); margin = self.left.margin
         stick_h = max(100, h - margin * 2 - 100)
         y1 = int((h - stick_h) / 2); y2 = int(y1 + stick_h)
@@ -336,14 +366,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.right.add_or_update_plot(idx_added, x_data, y_data, y1, y2, color, y_min=data_min, y_max=data_max)
         self.coords.update_stick_data(idx_added, color, data_min, data_max, y1, y2, x_data, y_data)
         self._plotted_keys.add(desc['key'])
-        # если ряд уже был memmap — учтём путь для корректной очистки
+        # ???? ??? ??? ??? memmap ? ????? ???? ??? ?????????? ???????
         try:
             import numpy as _np
             if isinstance(y_data, _np.memmap):
                 self._plot_tmp_paths[idx_added] = str(getattr(y_data, 'filename', ''))
         except Exception:
             pass
-        # отметим, что этот график хранится в RAM (пока)
+        # ???????, ??? ???? ?????? ???????? ? RAM (????)
         self._memory_mru.append(idx_added)
         self._enforce_memory_limit()
 
@@ -356,8 +386,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def clear_all(self):
         self.left.clear_all(); self.right.clear_all(); self.coords.clear_all()
-        # Не очищаем импортированные данные: их можно добавлять повторно
-        # Чистим временные файлы меммапов Y
+        # ?? ??????? ??????????????? ??????: ?? ????? ????????? ????????
+        # ?????? ????????? ????? ???????? Y
         for p in list(self._plot_tmp_paths.values()):
             try:
                 if Path(p).exists():
@@ -365,7 +395,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self._plot_tmp_paths.clear()
-        # Чистим X-меммапы провайдеров
+        # ?????? X-??????? ???????????
         for prov in list(self._providers.values()):
             try:
                 prov.cleanup()
@@ -379,20 +409,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- memory management: demote older Y arrays to memmap when exceeding threshold ---
     def _enforce_memory_limit(self):
-        # оставляем только последние self._max_memory_series индексов в RAM
+        # ????????? ?????? ????????? self._max_memory_series ???????? ? RAM
         while len(self._memory_mru) > self._max_memory_series:
             idx_to_demote = self._memory_mru.pop(0)
             self._demote_plot_to_memmap(idx_to_demote)
 
     def _demote_plot_to_memmap(self, idx: int):
-        # если уже понижен — ничего не делаем
+        # ???? ??? ??????? ? ?????? ?? ??????
         if idx in self._plot_tmp_paths:
             return
         plot_data = self.right._plots.get(idx) if hasattr(self.right, "_plots") else None
         if not plot_data:
             return
-        # Индикатор переноса на диск (без отмены)
-        pdialog = QtWidgets.QProgressDialog("Перенос графика на диск…", "", 0, 0, self)
+        # ????????? ???????? ?? ???? (??? ??????)
+        pdialog = QtWidgets.QProgressDialog("Перенос графика на диск...", "", 0, 0, self)
         pdialog.setWindowTitle("Оптимизация памяти")
         pdialog.setWindowModality(QtCore.Qt.ApplicationModal)
         pdialog.setMinimumDuration(0)
@@ -401,9 +431,9 @@ class MainWindow(QtWidgets.QMainWindow):
         y_data = plot_data['y_data']
         y_top = plot_data['y_top']; y_bottom = plot_data['y_bottom']
         color = plot_data['color']
-        # сохраняем Y в tmp и открываем как memmap
+        # ????????? Y ? tmp ? ????????? ??? memmap
         try:
-            # если уже memmap — ничего делать не нужно
+            # ???? ??? memmap ? ?????? ?????? ?? ?????
             try:
                 import numpy as _np
                 if isinstance(y_data, _np.memmap):
@@ -416,25 +446,25 @@ class MainWindow(QtWidgets.QMainWindow):
             tmp.close()
             np.save(tmp_path, np.asarray(y_data))
             y_mem = np.load(tmp_path, mmap_mode="r")
-            # переустанавливаем график на memmap
-            # сохраняем прежние min/max, чтобы не сканировать
+            # ????????????????? ?????? ?? memmap
+            # ????????? ??????? min/max, ????? ?? ???????????
             y_min = float(plot_data.get('y_data_min', 0.0))
             y_max = float(plot_data.get('y_data_max', 1.0))
             self.right.add_or_update_plot(idx, x_data, y_mem, y_top, y_bottom, color, y_min=y_min, y_max=y_max)
-            # обновляем координатную панель
+            # ????????? ???????????? ??????
             if idx in self.coords._sticks_data:
                 data = self.coords._sticks_data[idx]
                 self.coords.update_stick_data(idx, data['color'], data['data_min'], data['data_max'],
                                               y_top, y_bottom, x_data, y_mem)
             self._plot_tmp_paths[idx] = tmp_path
         except Exception as e:
-            # если не удалось, возвращаем idx в конец MRU (считаем что он остаётся в RAM)
+            # ???? ?? ???????, ?????????? idx ? ????? MRU (??????? ??? ?? ???????? ? RAM)
             self._memory_mru.append(idx)
         finally:
             pdialog.close()
 
     def closeEvent(self, event):
-        # чистим ресурсы перед закрытием
+        # ?????? ??????? ????? ?????????
         try:
             self._save_user_settings()
             self.clear_all()
@@ -465,7 +495,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._preload_all_series()
 
     def _preload_all_series(self):
-        # Предзагрузка по файлам с детальным прогрессом на каждый файл
+        # ???????????? ?? ?????? ? ????????? ?????????? ?? ?????? ????
         has_series = any(len(entry.get('series', [])) > 0 for entry in self._datasets)
         if not has_series:
             QtWidgets.QMessageBox.information(self, "Нет данных", "Сначала загрузите файлы.")
@@ -481,18 +511,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 break
 
     def _preload_provider_series(self, file_path: Path, provider, series_list: list, progress: QtWidgets.QProgressDialog | None = None, current_step: int = 0) -> bool:
-        # Готовим подробный прогресс: сначала показываем диалог сразу, затем оцениваем строки
+        # ??????? ????????? ????????: ??????? ?????????? ?????? ?????, ????? ????????? ??????
         local_progress = progress
         if local_progress is None:
-            local_progress = QtWidgets.QProgressDialog(f"{file_path.name}: инициализация…", "Отмена", 0, 0, self)
+            local_progress = QtWidgets.QProgressDialog(f"{file_path.name}: инициализация...", "Отмена", 0, 0, self)
             local_progress.setWindowTitle("Предзагрузка файла")
             local_progress.setWindowModality(QtCore.Qt.ApplicationModal)
             local_progress.setMinimumDuration(0)
             local_progress.setValue(0)
             QtWidgets.QApplication.processEvents()
 
-        # Оценка количества строк (может занять время) — показываем статус сразу
-        local_progress.setLabelText(f"{file_path.name}: оценка объёма данных…")
+        # ?????? ?????????? ????? (????? ?????? ?????) ? ?????????? ?????? ?????
+        local_progress.setLabelText(f"{file_path.name}: оценка объёма данных...")
         QtWidgets.QApplication.processEvents()
 
         total_rows = 0
@@ -500,21 +530,21 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(provider, "estimate_rows"):
                 total_rows = int(provider.estimate_rows())
             else:
-                # попробуем получить длину X (может быть тяжело для некоторых форматов)
+                # ????????? ???????? ????? X (????? ???? ?????? ??? ????????? ????????)
                 x_tmp = provider.ensure_x_loaded()
                 try:
                     total_rows = len(x_tmp)
                 except Exception:
                     total_rows = 0
         except InterruptedError:
-            # пользователь отменил во время оценки — прерываем
+            # ???????????? ??????? ?? ????? ?????? ? ?????????
             if progress is None and local_progress is not None:
                 local_progress.close()
             return True
         except Exception:
             total_rows = 0
 
-        # Теперь можно установить точный диапазон прогресса
+        # ?????? ????? ?????????? ?????? ???????? ?????????
         units_total = total_rows * (1 + len(series_list))
         if units_total > 0:
             local_progress.setRange(0, units_total)
@@ -523,22 +553,22 @@ class MainWindow(QtWidgets.QMainWindow):
             local_progress.setRange(0, 0)
         QtWidgets.QApplication.processEvents()
 
-        # Подготавливаем X
+        # ?????????????? X
         try:
             if local_progress:
-                local_progress.setLabelText(f"{file_path.name}: Подготовка X…")
+                local_progress.setLabelText(f"{file_path.name}: Подготовка X...")
                 QtWidgets.QApplication.processEvents()
-            # прогресс по X: базовый offset = 0
+            # ???????? ?? X: ??????? offset = 0
             base_offset = 0
             def cb_x(done, total, label):
                 if local_progress and units_total > 0:
-                    # done уже в "строках"
+                    # done ??? ? "???????"
                     local_progress.setValue(base_offset + int(done))
                     local_progress.setLabelText(f"{file_path.name}: X {done}/{total} ({int((done/max(1,total))*100)}%)")
                     QtWidgets.QApplication.processEvents()
             provider.ensure_x_loaded(progress=cb_x, total_hint=total_rows or None)
         except InterruptedError:
-            # отмена пользователем
+            # ?????? ?????????????
             if progress is None and local_progress is not None:
                 local_progress.close()
             return True
@@ -548,7 +578,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 local_progress.close()
             return False
 
-        # Для каждой серии — подготовить Y (накапливаем offset)
+        # ??? ?????? ????? ? ??????????? Y (??????????? offset)
         base_offset = total_rows if total_rows > 0 else 0
         for desc in series_list:
             if local_progress and local_progress.wasCanceled():
@@ -561,7 +591,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     local_progress.close()
                 return True
             if local_progress:
-                local_progress.setLabelText(f"{file_path.name}: {desc['name']}…")
+                local_progress.setLabelText(f"{file_path.name}: {desc['name']}?")
                 QtWidgets.QApplication.processEvents()
             try:
                 def cb_y(done, total, label):
@@ -585,7 +615,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return False
 
     def _rollback_new_imports(self, file_paths: List[Path]):
-        # Удаляем datasets и провайдеры добавленные в этом запуске
+        # ??????? datasets ? ?????????? ??????????? ? ???? ???????
         paths_set = set(Path(p) for p in file_paths)
         # remove datasets entries
         self._datasets = [d for d in self._datasets if Path(d.get('path')) not in paths_set]
@@ -635,3 +665,161 @@ class MainWindow(QtWidgets.QMainWindow):
             self._settings.setValue("max_memory_series", int(self._max_memory_series))
         except Exception:
             pass
+
+class CalculationWorker(QtCore.QObject):
+    progress = QtCore.pyqtSignal(int)
+    finished = QtCore.pyqtSignal(str)
+
+    def __init__(self, steps: int = 100, delay_s: float = 0.02):
+        super().__init__()
+        self._steps = int(steps)
+        self._delay_s = float(delay_s)
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        for i in range(self._steps + 1):
+            time.sleep(self._delay_s)
+            self.progress.emit(i)
+        self.finished.emit("Расчет завершен. Логика режима пока не подключена.")
+
+
+class CalculationDialog(QtWidgets.QDialog):
+    def __init__(self, title: str, plots: list[tuple[int, str]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(420, 320)
+
+        self._plots = plots
+        self._worker_thread = None
+        self._worker = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self._stack = QtWidgets.QStackedWidget()
+        layout.addWidget(self._stack)
+
+        self._page_graph = self._build_graph_page()
+        self._page_mode = self._build_mode_page()
+        self._page_format = self._build_format_page()
+        self._page_run = self._build_run_page()
+
+        self._stack.addWidget(self._page_graph)
+        self._stack.addWidget(self._page_mode)
+        self._stack.addWidget(self._page_format)
+        self._stack.addWidget(self._page_run)
+
+        btns = QtWidgets.QHBoxLayout()
+        self._btn_back = QtWidgets.QPushButton("Назад")
+        self._btn_next = QtWidgets.QPushButton("Продолжить")
+        self._btn_close = QtWidgets.QPushButton("Закрыть")
+        btns.addWidget(self._btn_back)
+        btns.addWidget(self._btn_next)
+        btns.addStretch(1)
+        btns.addWidget(self._btn_close)
+        layout.addLayout(btns)
+
+        self._btn_back.clicked.connect(self._prev_step)
+        self._btn_next.clicked.connect(self._next_step)
+        self._btn_close.clicked.connect(self.reject)
+
+        self._update_nav()
+
+    def _build_graph_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(page)
+        lay.addWidget(QtWidgets.QLabel("Шаг 1. Выбор графика"))
+        self._graph_combo = QtWidgets.QComboBox()
+        if self._plots:
+            for idx, label in self._plots:
+                self._graph_combo.addItem(label, idx)
+        else:
+            self._graph_combo.addItem("Нет активных графиков")
+            self._graph_combo.setEnabled(False)
+        lay.addWidget(self._graph_combo)
+        lay.addStretch(1)
+        return page
+
+    def _build_mode_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(page)
+        lay.addWidget(QtWidgets.QLabel("Шаг 2. Режим и параметры"))
+        self._mode_combo = QtWidgets.QComboBox()
+        self._mode_combo.addItem("Основной режим")
+        lay.addWidget(self._mode_combo)
+        lay.addWidget(QtWidgets.QLabel("Параметры отсутствуют"))
+        lay.addStretch(1)
+        return page
+
+    def _build_format_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(page)
+        lay.addWidget(QtWidgets.QLabel("Шаг 3. Формат результата"))
+        self._format_combo = QtWidgets.QComboBox()
+        self._format_combo.addItems([
+            "Добавить как новый график",
+            "Сохранить в файл",
+        ])
+        lay.addWidget(self._format_combo)
+        lay.addStretch(1)
+        return page
+
+    def _build_run_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(page)
+        lay.addWidget(QtWidgets.QLabel("Шаг 4. Расчет"))
+        self._progress = QtWidgets.QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._status = QtWidgets.QLabel("Готово к расчету")
+        self._calc_btn = QtWidgets.QPushButton("Рассчитать")
+        self._calc_btn.clicked.connect(self._start_calculation)
+        lay.addWidget(self._progress)
+        lay.addWidget(self._status)
+        lay.addWidget(self._calc_btn)
+        lay.addStretch(1)
+        return page
+
+    def _update_nav(self):
+        idx = self._stack.currentIndex()
+        self._btn_back.setEnabled(idx > 0)
+        self._btn_next.setEnabled(idx < self._stack.count() - 1)
+        if not self._plots:
+            self._btn_next.setEnabled(False)
+
+    def _next_step(self):
+        idx = self._stack.currentIndex()
+        if idx < self._stack.count() - 1:
+            self._stack.setCurrentIndex(idx + 1)
+        self._update_nav()
+
+    def _prev_step(self):
+        idx = self._stack.currentIndex()
+        if idx > 0:
+            self._stack.setCurrentIndex(idx - 1)
+        self._update_nav()
+
+    def _start_calculation(self):
+        if self._worker_thread is not None:
+            return
+        self._progress.setValue(0)
+        self._status.setText("Выполняется расчет...")
+        self._calc_btn.setEnabled(False)
+        self._btn_back.setEnabled(False)
+        self._btn_next.setEnabled(False)
+
+        self._worker_thread = QtCore.QThread(self)
+        self._worker = CalculationWorker()
+        self._worker.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._progress.setValue)
+        self._worker.finished.connect(self._on_calc_finished)
+        self._worker.finished.connect(self._worker_thread.quit)
+        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker_thread.start()
+
+    def _on_calc_finished(self, message: str):
+        self._status.setText(message)
+        self._btn_back.setEnabled(True)
+        self._btn_next.setEnabled(True)
+        self._btn_close.setEnabled(True)
+        self._worker_thread = None
+        self._worker = None

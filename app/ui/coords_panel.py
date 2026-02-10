@@ -46,7 +46,7 @@ class CoordinatesPanel(QtWidgets.QWidget):
         y_data = data['y_data']
         if len(x_data) == 0:
             return None
-        # быстрая интерполяция по ближайшим двум точкам (O(log N) через searchsorted)
+        # ??????? ???????????? ?? ????????? ???? ?????? (O(log N) ????? searchsorted)
         try:
             x_arr = np.asarray(x_data)
             y_arr = np.asarray(y_data)
@@ -62,7 +62,7 @@ class CoordinatesPanel(QtWidgets.QWidget):
             t = (self._cursor_x - x0) / (x1 - x0)
             return float(y0 + t * (y1 - y0))
         except Exception:
-            # fallback на ближайшую точку
+            # fallback ?? ????????? ?????
             idx_closest = min(range(len(x_data)), key=lambda j: abs(x_data[j] - self._cursor_x))
             return float(y_data[idx_closest])
 

@@ -208,9 +208,4 @@ class DotsCanvas(QtWidgets.QWidget):
         self._recalc_grid()
         super().resizeEvent(e)
 
-    def contextMenuEvent(self, e):
-        menu = QtWidgets.QMenu(self)
-        a_add = menu.addAction("Добавить")
-        chosen = menu.exec_(e.globalPos())
-        if chosen is a_add:
-            print("Добавить")
+
