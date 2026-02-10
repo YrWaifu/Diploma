@@ -151,7 +151,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return (x, y)
 
     def _open_calculation_dialog(self, title: str):
-        dlg = CalculationDialog(title, self._get_active_plots(), self)
+        plots = self._get_active_plots()
+        if title == "Тензометрирование (прочность)":
+            dlg = TensometryDialog(plots, self)
+        else:
+            dlg = CalculationDialog(title, plots, self)
         dlg.exec_()
 
     def _save_project(self):
@@ -753,14 +757,182 @@ class TensometryWorker(QtCore.QObject):
         self.finished.emit("Расчет характеристик тензосигнала завершен.")
 
 
-class CalculationDialog(QtWidgets.QDialog):
-    TENSOMETRY_TITLE = "Тензометрирование (прочность)"
+class TensometryBatchWorker(QtCore.QObject):
+    """Воркер: список (метка, массив y), показатель Минера → по одному результат на график."""
+    progress = QtCore.pyqtSignal(int)
+    one_result = QtCore.pyqtSignal(str, object)  # label, StrainResult
+    finished = QtCore.pyqtSignal(str)
 
+    def __init__(self, items: list, miner_exponent: float = 5.0):
+        super().__init__()
+        self._items = list(items)  # [(label, y_array), ...]
+        self._miner_exponent = float(miner_exponent)
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        n = len(self._items)
+        for i, (label, y_arr) in enumerate(self._items):
+            y = np.asarray(y_arr, dtype=float)
+            r = compute_strain_characteristics(y, miner_exponent=self._miner_exponent)
+            self.one_result.emit(label, r)
+            self.progress.emit(int((i + 1) * 100 / n) if n else 100)
+        self.finished.emit("Расчет завершен.")
+
+
+class TensometryDialog(QtWidgets.QDialog):
+    """Одно окно: выбор графиков (галочки), параметр Минера, кнопка «Рассчитать», блок результатов."""
+
+    def __init__(self, plots: list[tuple[int, str]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Тензометрирование (прочность)")
+        self.resize(520, 560)
+        self._plots = plots
+        self._worker_thread = None
+        self._worker = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # --- Графики для анализа ---
+        grp_graphs = QtWidgets.QGroupBox("Графики для анализа")
+        grp_graphs_lay = QtWidgets.QVBoxLayout(grp_graphs)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_select_all = QtWidgets.QPushButton("Выбрать все")
+        btn_select_none = QtWidgets.QPushButton("Снять все")
+        btn_select_all.clicked.connect(self._check_all_graphs)
+        btn_select_none.clicked.connect(self._uncheck_all_graphs)
+        btn_row.addWidget(btn_select_all)
+        btn_row.addWidget(btn_select_none)
+        btn_row.addStretch(1)
+        grp_graphs_lay.addLayout(btn_row)
+        self._graph_list = QtWidgets.QListWidget()
+        self._graph_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        for idx, label in plots:
+            item = QtWidgets.QListWidgetItem(label)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Unchecked)
+            item.setData(QtCore.Qt.UserRole, idx)
+            self._graph_list.addItem(item)
+        if not plots:
+            self._graph_list.addItem(QtWidgets.QListWidgetItem("Нет активных графиков"))
+        grp_graphs_lay.addWidget(self._graph_list)
+        layout.addWidget(grp_graphs)
+
+        # --- Параметры ---
+        grp_params = QtWidgets.QGroupBox("Параметры")
+        params_lay = QtWidgets.QHBoxLayout(grp_params)
+        params_lay.addWidget(QtWidgets.QLabel("Показатель Минера (m):"))
+        self._miner_spin = QtWidgets.QDoubleSpinBox()
+        self._miner_spin.setRange(2.0, 20.0)
+        self._miner_spin.setValue(5.0)
+        self._miner_spin.setDecimals(1)
+        params_lay.addWidget(self._miner_spin)
+        params_lay.addStretch(1)
+        layout.addWidget(grp_params)
+
+        # --- Рассчитать ---
+        self._progress = QtWidgets.QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setVisible(False)
+        self._calc_btn = QtWidgets.QPushButton("Рассчитать")
+        self._calc_btn.clicked.connect(self._run_calculation)
+        layout.addWidget(self._progress)
+        layout.addWidget(self._calc_btn)
+
+        # --- Результаты ---
+        grp_results = QtWidgets.QGroupBox("Результаты")
+        results_lay = QtWidgets.QVBoxLayout(grp_results)
+        self._results_text = QtWidgets.QTextEdit()
+        self._results_text.setReadOnly(True)
+        self._results_text.setPlaceholderText("Выберите графики, задайте параметр Минера и нажмите «Рассчитать».")
+        self._results_text.setMinimumHeight(200)
+        results_lay.addWidget(self._results_text)
+        layout.addWidget(grp_results)
+
+        # --- Закрыть ---
+        btn_close = QtWidgets.QPushButton("Закрыть")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+    def _check_all_graphs(self):
+        for i in range(self._graph_list.count()):
+            item = self._graph_list.item(i)
+            if item.data(QtCore.Qt.UserRole) is not None:
+                item.setCheckState(QtCore.Qt.Checked)
+
+    def _uncheck_all_graphs(self):
+        for i in range(self._graph_list.count()):
+            self._graph_list.item(i).setCheckState(QtCore.Qt.Unchecked)
+
+    def _run_calculation(self):
+        main_win = self.parent()
+        if not main_win or not hasattr(main_win, "get_plot_series_data"):
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Нет доступа к данным графика.")
+            return
+        checked = []
+        for i in range(self._graph_list.count()):
+            item = self._graph_list.item(i)
+            idx = item.data(QtCore.Qt.UserRole)
+            if idx is None:
+                continue
+            if item.flags() & QtCore.Qt.ItemIsUserCheckable and item.checkState() == QtCore.Qt.Checked:
+                label = item.text()
+                data = main_win.get_plot_series_data(idx)
+                if data is not None:
+                    x_data, y_data = data
+                    checked.append((label, y_data))
+                else:
+                    checked.append((label, None))
+        valid = [(lbl, y) for lbl, y in checked if y is not None]
+        if not valid:
+            msg = "Нет выбранных графиков с данными." if not checked else "Не удалось получить данные выбранных графиков."
+            QtWidgets.QMessageBox.warning(self, "Ошибка", msg)
+            return
+        miner = self._miner_spin.value()
+        self._results_text.clear()
+        self._progress.setVisible(True)
+        self._progress.setValue(0)
+        self._calc_btn.setEnabled(False)
+
+        self._worker_thread = QtCore.QThread(self)
+        self._worker = TensometryBatchWorker(valid, miner_exponent=miner)
+        self._worker.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._progress.setValue)
+        self._worker.one_result.connect(self._append_result)
+        self._worker.finished.connect(self._on_batch_finished)
+        self._worker.finished.connect(self._worker_thread.quit)
+        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker_thread.start()
+
+    def _append_result(self, label: str, r: StrainResult):
+        block = [
+            f"——— {label} ———",
+            f"  Минимум: {r.y_min:.6g}",
+            f"  Максимум: {r.y_max:.6g}",
+            f"  Среднее: {r.y_mean:.6g}",
+            f"  Число циклов: {r.n_cycles}",
+            f"  Макс. полуразмах: {r.max_half_range:.6g}",
+            f"  Мин. квазистатическое: {r.min_quasi_static:.6g}",
+            f"  Макс. квазистатическое: {r.max_quasi_static:.6g}",
+            f"  Эквив. полуразмах (Минера): {r.equivalent_half_range:.6g}",
+            "",
+        ]
+        self._results_text.append("\n".join(block))
+
+    def _on_batch_finished(self, message: str):
+        self._progress.setValue(100)
+        self._progress.setVisible(False)
+        self._calc_btn.setEnabled(True)
+        self._worker_thread = None
+        self._worker = None
+
+
+class CalculationDialog(QtWidgets.QDialog):
     def __init__(self, title: str, plots: list[tuple[int, str]], parent=None):
         super().__init__(parent)
-        self._title = title
         self.setWindowTitle(title)
-        self.resize(420, 420)
+        self.resize(420, 380)
 
         self._plots = plots
         self._worker_thread = None
@@ -770,7 +942,7 @@ class CalculationDialog(QtWidgets.QDialog):
         self._stack = QtWidgets.QStackedWidget()
         layout.addWidget(self._stack)
 
-        self._page_graph = self._build_graph_page()
+        self._build_graph_page()
         self._page_mode = self._build_mode_page()
         self._page_format = self._build_format_page()
         self._page_run = self._build_run_page()
@@ -797,8 +969,8 @@ class CalculationDialog(QtWidgets.QDialog):
         self._update_nav()
 
     def _build_graph_page(self) -> QtWidgets.QWidget:
-        page = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(page)
+        self._page_graph = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(self._page_graph)
         lay.addWidget(QtWidgets.QLabel("Шаг 1. Выбор графика"))
         self._graph_combo = QtWidgets.QComboBox()
         if self._plots:
@@ -809,7 +981,7 @@ class CalculationDialog(QtWidgets.QDialog):
             self._graph_combo.setEnabled(False)
         lay.addWidget(self._graph_combo)
         lay.addStretch(1)
-        return page
+        return self._page_graph
 
     def _build_mode_page(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -818,18 +990,7 @@ class CalculationDialog(QtWidgets.QDialog):
         self._mode_combo = QtWidgets.QComboBox()
         self._mode_combo.addItem("Основной режим")
         lay.addWidget(self._mode_combo)
-        self._miner_spin = None
-        if self._title == self.TENSOMETRY_TITLE:
-            miner_row = QtWidgets.QHBoxLayout()
-            miner_row.addWidget(QtWidgets.QLabel("Показатель Минера (m):"))
-            self._miner_spin = QtWidgets.QDoubleSpinBox()
-            self._miner_spin.setRange(2.0, 20.0)
-            self._miner_spin.setValue(5.0)
-            self._miner_spin.setDecimals(1)
-            miner_row.addWidget(self._miner_spin)
-            lay.addLayout(miner_row)
-        else:
-            lay.addWidget(QtWidgets.QLabel("Параметры отсутствуют"))
+        lay.addWidget(QtWidgets.QLabel("Параметры отсутствуют"))
         lay.addStretch(1)
         return page
 
@@ -890,59 +1051,7 @@ class CalculationDialog(QtWidgets.QDialog):
     def _start_calculation(self):
         if self._worker_thread is not None:
             return
-        if self._title == self.TENSOMETRY_TITLE:
-            self._start_tensometry()
-        else:
-            self._start_generic()
-
-    def _start_tensometry(self):
-        main_win = self.parent()
-        if not main_win or not hasattr(main_win, "get_plot_series_data"):
-            QtWidgets.QMessageBox.warning(self, "Ошибка", "Нет доступа к данным графика.")
-            return
-        plot_idx = self._graph_combo.currentData()
-        if plot_idx is None:
-            QtWidgets.QMessageBox.warning(self, "Ошибка", "Выберите график.")
-            return
-        data = main_win.get_plot_series_data(plot_idx)
-        if data is None:
-            QtWidgets.QMessageBox.warning(self, "Ошибка", "Не удалось получить данные выбранного графика.")
-            return
-        x_data, y_data = data
-        miner = 5.0
-        if self._miner_spin is not None:
-            miner = self._miner_spin.value()
-        self._progress.setValue(0)
-        self._status.setText("Выполняется расчет характеристик тензосигнала...")
-        self._results_text.clear()
-        self._calc_btn.setEnabled(False)
-        self._btn_back.setEnabled(False)
-        self._btn_next.setEnabled(False)
-
-        self._worker_thread = QtCore.QThread(self)
-        self._worker = TensometryWorker(y_data, miner_exponent=miner)
-        self._worker.moveToThread(self._worker_thread)
-        self._worker_thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self._progress.setValue)
-        self._worker.strain_result.connect(self._on_strain_result)
-        self._worker.finished.connect(self._on_calc_finished)
-        self._worker.finished.connect(self._worker_thread.quit)
-        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
-        self._worker_thread.start()
-
-    def _on_strain_result(self, r: StrainResult):
-        lines = [
-            "Характеристики тензосигнала:",
-            f"  Минимум: {r.y_min:.6g}",
-            f"  Максимум: {r.y_max:.6g}",
-            f"  Среднее: {r.y_mean:.6g}",
-            f"  Число циклов: {r.n_cycles}",
-            f"  Максимальный полуразмах: {r.max_half_range:.6g}",
-            f"  Мин. квазистатическое: {r.min_quasi_static:.6g}",
-            f"  Макс. квазистатическое: {r.max_quasi_static:.6g}",
-            f"  Эквивалентный полуразмах (Минера): {r.equivalent_half_range:.6g}",
-        ]
-        self._results_text.setPlainText("\n".join(lines))
+        self._start_generic()
 
     def _start_generic(self):
         self._progress.setValue(0)

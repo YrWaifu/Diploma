@@ -78,12 +78,13 @@ def compute_strain_characteristics(
     min_qs = float(np.min(quasi_statics))
     max_qs = float(np.max(quasi_statics))
 
-    # Эквивалентный полуразмах по Минеру: a_eq = (sum a_k^m)^(1/m)
+    # По формуле из ВКР: a_eq = ((1/M) * Σ a_k^m)^(1/m)
     a_arr = np.array(half_ranges, dtype=float)
     m = float(miner_exponent)
     if m <= 0 or not np.isfinite(m):
         m = 5.0
-    a_eq = float(np.power(np.sum(np.power(a_arr, m)), 1.0 / m))
+    M = a_arr.size
+    a_eq = float(np.power(np.sum(np.power(a_arr, m)) / M, 1.0 / m))
 
     return StrainResult(
         y_min=y_min,
