@@ -1,3 +1,5 @@
 *.csv
 *.parquet
 *.xslx
+venv
+*__pycache__*
