@@ -92,6 +92,9 @@ class MainWindow(QtWidgets.QMainWindow):
         export_action = file_menu.addAction("Экспорт")
         export_action.triggered.connect(self._export_results)
 
+        self._recent_menu = file_menu.addMenu("Недавние")
+        file_menu.aboutToShow.connect(self._update_recent_menu)
+
         calc_menu = menu.addMenu("Расчеты")
         for name in [
             "Выгрузить и отобразить",
@@ -325,6 +328,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 save_project(state, self._project_path)
                 self.setWindowTitle(f"ODiploma — {self._project_path.name}")
                 self._project_dirty = False
+                self._add_to_recent(self._project_path)
                 return True
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "Ошибка сохранения", str(e))
@@ -350,6 +354,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._project_path = path
             self.setWindowTitle(f"ODiploma — {path.name}")
             self._project_dirty = False
+            self._add_to_recent(path)
             return True
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Ошибка сохранения", str(e))
@@ -357,6 +362,81 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _export_results(self):
         QtWidgets.QMessageBox.information(self, "Экспорт", "Экспорт пока не реализован.")
+
+    _MAX_RECENT_FILES = 10
+    _RECENT_FILES_KEY = "recent_files"
+
+    def _get_recent_files(self) -> List[Path]:
+        """Список недавно открытых файлов из настроек."""
+        try:
+            raw = self._settings.value(self._RECENT_FILES_KEY, "")
+            if isinstance(raw, str) and raw:
+                return [Path(p.strip()) for p in raw.split("\n") if p.strip()]
+        except Exception:
+            pass
+        return []
+
+    def _add_to_recent(self, path: Path) -> None:
+        """Добавить путь в начало списка недавних (без дубликатов, не более MAX)."""
+        path = path.resolve()
+        if not path.exists():
+            return
+        paths = self._get_recent_files()
+        paths = [path] + [p for p in paths if str(p.resolve()) != str(path)]
+        paths = paths[: self._MAX_RECENT_FILES]
+        self._settings.setValue(self._RECENT_FILES_KEY, "\n".join(str(p) for p in paths))
+
+    def _update_recent_menu(self) -> None:
+        """Заполняет подменю «Недавние» перед показом."""
+        self._recent_menu.clear()
+        recent = self._get_recent_files()
+        for p in recent:
+            if not p.exists():
+                continue
+            name = p.name
+            if len(str(p)) > 60:
+                name = "..." + p.name
+            action = self._recent_menu.addAction(name)
+            action.setData(str(p))
+            action.setToolTip(str(p))
+            action.triggered.connect(lambda checked=False, fp=str(p): self._open_recent_file(Path(fp)))
+        if recent:
+            self._recent_menu.addSeparator()
+            clear_action = self._recent_menu.addAction("Очистить список")
+            clear_action.triggered.connect(self._clear_recent_list)
+        elif not recent:
+            a = self._recent_menu.addAction("(нет недавних файлов)")
+            a.setEnabled(False)
+
+    def _open_recent_file(self, path: Path) -> None:
+        """Открыть файл из списка недавних (проект или данные)."""
+        path = Path(path)
+        if not path.exists():
+            self._remove_from_recent(path)
+            QtWidgets.QMessageBox.warning(self, "Файл не найден", f"Файл не найден:\n{path}")
+            return
+        if is_project_file(path):
+            try:
+                state = load_project(path)
+                self.apply_project_state(state)
+                self._project_path = path
+                self._project_dirty = False
+                self.setWindowTitle(f"ODiploma — {path.name}")
+                self._add_to_recent(path)
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "Ошибка открытия проекта", str(e))
+        else:
+            self._add_to_recent(path)
+            self._project_path = None
+            self._load_data_from_paths([path])
+
+    def _remove_from_recent(self, path: Path) -> None:
+        path = path.resolve()
+        paths = [p for p in self._get_recent_files() if str(Path(p).resolve()) != str(path)]
+        self._settings.setValue(self._RECENT_FILES_KEY, "\n".join(str(p) for p in paths))
+
+    def _clear_recent_list(self) -> None:
+        self._settings.remove(self._RECENT_FILES_KEY)
 
     def clear_plots_only(self):
         self.left.clear_all()
@@ -394,17 +474,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._project_path = path
                 self._project_dirty = False
                 self.setWindowTitle(f"ODiploma — {path.name}")
+                self._add_to_recent(path)
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "Ошибка открытия проекта", str(e))
             return
 
-        # Импорт данных: сбрасываем путь проекта (сохранение будет «Сохранить как»)
+        self._add_to_recent(Path(filepaths[0]))
+        self._load_data_from_paths([Path(f) for f in filepaths])
+
+    def _load_data_from_paths(self, filepaths: List[Path]) -> None:
+        """Импорт данных по списку путей (без диалога)."""
+        if not filepaths:
+            return
         self._project_path = None
         imported = 0
         was_canceled = False
         new_file_paths: List[Path] = []
-        # В режиме предзагрузки не показываем общий прогресс заголовков,
-        # чтобы не дублировать с детальным прогрессом по файлу
         use_headers_progress = self._load_mode != "preload_all"
         progress = None
         if use_headers_progress:
@@ -412,9 +497,8 @@ class MainWindow(QtWidgets.QMainWindow):
             progress.setWindowTitle("Импорт файлов")
             progress.setWindowModality(QtCore.Qt.ApplicationModal)
             progress.setMinimumDuration(300)
-        for i, fpath in enumerate(filepaths):
+        for i, file_path in enumerate(filepaths):
             try:
-                file_path = Path(fpath)
                 if progress is not None:
                     progress.setLabelText(f"Чтение: {file_path.name}")
                     progress.setValue(i)
@@ -436,15 +520,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._datasets.append({'path': file_path, 'series': series_list, 'x_name': info.x_name})
                 new_file_paths.append(file_path)
                 imported += len(info.y_names)
-                # Если включён режим предзагрузки — подготовим X и все Y сразу
                 if self._load_mode == "preload_all":
-                    # Покажем только детальный прогресс на файл (без общего)
                     canceled = self._preload_provider_series(file_path, provider, series_list, None, 0)
                     if canceled:
                         was_canceled = True
                         break
             except Exception as e:
-                QtWidgets.QMessageBox.warning(self, "Ошибка", f"Не удалось загрузить файл\n{fpath}\n\n{e}")
+                QtWidgets.QMessageBox.warning(self, "Ошибка", f"Не удалось загрузить файл\n{file_path}\n\n{e}")
         if progress is not None:
             progress.setValue(len(filepaths))
             if progress.wasCanceled():
