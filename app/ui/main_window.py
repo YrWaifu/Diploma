@@ -21,6 +21,164 @@ from app.processing import (
 )
 
 
+class _PreloadWorker(QtCore.QObject):
+    """Воркер предзагрузки файла в фоне, чтобы не блокировать GUI (оценка размера + чтение X и всех Y)."""
+    progress_value = QtCore.pyqtSignal(int)
+    progress_label = QtCore.pyqtSignal(str)
+    progress_range = QtCore.pyqtSignal(int)
+    finished_signal = QtCore.pyqtSignal(bool)  # canceled
+
+    def __init__(self, provider, file_path: Path, series_list: list):
+        super().__init__()
+        self._provider = provider
+        self._file_path = file_path
+        self._series_list = series_list
+        self._canceled = False
+
+    @QtCore.pyqtSlot()
+    def request_cancel(self):
+        self._canceled = True
+        if hasattr(self._provider, "request_cancel"):
+            try:
+                self._provider.request_cancel()
+            except Exception:
+                pass
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            self.progress_label.emit(f"{self._file_path.name}: оценка объёма данных...")
+            total_rows = 0
+            if hasattr(self._provider, "estimate_rows"):
+                total_rows = int(self._provider.estimate_rows())
+            else:
+                try:
+                    x_tmp = self._provider.ensure_x_loaded()
+                    total_rows = len(x_tmp) if hasattr(x_tmp, "__len__") else 0
+                except Exception:
+                    total_rows = 0
+        except InterruptedError:
+            self._canceled = True
+            self.finished_signal.emit(True)
+            return
+        except Exception:
+            total_rows = 0
+
+        units_total = total_rows * (1 + len(self._series_list))
+        if units_total > 0:
+            self.progress_range.emit(units_total)
+        self.progress_value.emit(0)
+
+        try:
+            self.progress_label.emit(f"{self._file_path.name}: Подготовка X...")
+            base_offset = 0
+
+            def cb_x(done, total, _label):
+                if units_total > 0:
+                    self.progress_value.emit(base_offset + int(min(done, total) if total else done))
+                    self.progress_label.emit(f"{self._file_path.name}: X {done}/{total} ({int((done / max(1, total)) * 100)}%)")
+
+            self._provider.ensure_x_loaded(progress=cb_x, total_hint=total_rows or None)
+        except InterruptedError:
+            self._canceled = True
+            self.finished_signal.emit(True)
+            return
+        except Exception:
+            self.finished_signal.emit(True)
+            return
+
+        base_offset = total_rows if total_rows > 0 else 0
+        for desc in self._series_list:
+            if self._canceled:
+                self.finished_signal.emit(True)
+                return
+            self.progress_label.emit(f"{self._file_path.name}: {desc['name']}")
+            try:
+                def cb_y(done, total, _label):
+                    if units_total > 0:
+                        self.progress_value.emit(base_offset + int(min(done, total) if total else done))
+                        self.progress_label.emit(f"{self._file_path.name}: {desc['name']} {done}/{total} ({int((done / max(1, total)) * 100)}%)")
+
+                self._provider.load_y(desc['name'], progress=cb_y, total_hint=total_rows or None)
+                base_offset += total_rows if total_rows > 0 else 0
+            except InterruptedError:
+                self._canceled = True
+                self.finished_signal.emit(True)
+                return
+            except Exception:
+                continue
+
+        if units_total > 0:
+            self.progress_value.emit(units_total)
+        self.finished_signal.emit(False)
+
+
+class _RestoreProjectWorker(QtCore.QObject):
+    """Воркер восстановления проекта: загрузка рядов в фоне с прогрессом, без зависания GUI."""
+    progress_value = QtCore.pyqtSignal(int)
+    progress_label = QtCore.pyqtSignal(str)
+    progress_range = QtCore.pyqtSignal(int)
+    one_series_loaded = QtCore.pyqtSignal(str, str, object, object, object)  # path_str, series_name, x_data, y_data, stick
+    finished_signal = QtCore.pyqtSignal(bool)
+
+    def __init__(self, plots: list, providers: dict):
+        super().__init__()
+        self._plots = list(plots)
+        self._providers = providers
+        self._canceled = False
+        self._scale = 1000
+
+    @QtCore.pyqtSlot()
+    def request_cancel(self):
+        self._canceled = True
+        for p in self._providers.values():
+            if hasattr(p, "request_cancel"):
+                try:
+                    p.request_cancel()
+                except Exception:
+                    pass
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        n = len(self._plots)
+        self.progress_range.emit(n * self._scale)
+        self.progress_value.emit(0)
+        for i, plot in enumerate(self._plots):
+            if self._canceled:
+                self.finished_signal.emit(True)
+                return
+            path_str = plot.get("source_path", "")
+            series_name = plot.get("series_name", "")
+            stick = plot.get("stick")
+            file_path = Path(path_str)
+            provider = self._providers.get(file_path)
+            if not provider:
+                continue
+            self.progress_label.emit(f"Загрузка ряда {i + 1}/{n}...")
+            self.progress_value.emit(i * self._scale)
+            try:
+                def cb(done, total, label):
+                    if total and total > 0:
+                        frac = min(1.0, (done / total))
+                        self.progress_value.emit(int((i + frac) * self._scale))
+                    if label:
+                        self.progress_label.emit(f"Ряд {i + 1}/{n}: {label}")
+                x_data = provider.ensure_x_loaded(progress=cb, total_hint=None)
+                if self._canceled:
+                    self.finished_signal.emit(True)
+                    return
+                y_data = provider.load_y(series_name, progress=cb, total_hint=None)
+                self.progress_value.emit((i + 1) * self._scale)
+                self.one_series_loaded.emit(path_str, series_name, x_data, y_data, stick)
+            except InterruptedError:
+                self._canceled = True
+                self.finished_signal.emit(True)
+                return
+            except Exception:
+                continue
+        self.finished_signal.emit(False)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -77,6 +235,78 @@ class MainWindow(QtWidgets.QMainWindow):
         self.right.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.right.customContextMenuRequested.connect(lambda pos: self._show_plot_context_menu(self.right, pos))
 
+    # Единый стиль прогресс-диалогов (чтобы было понятно, что идёт загрузка, а не зависание)
+    _PROGRESS_STYLE = """
+        QProgressDialog {
+            background-color: #fafafa;
+            font-size: 10pt;
+        }
+        QProgressDialog QLabel {
+            color: #333;
+            min-width: 280px;
+        }
+        QProgressBar {
+            min-height: 12px;
+            max-height: 20px;
+            border: 1px solid #c0c0c0;
+            border-radius: 4px;
+            background: #e8e8e8;
+            text-align: center;
+        }
+        QProgressBar::chunk {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #5ba3f8, stop:1 #2d7dd2);
+            border-radius: 3px;
+        }
+        QPushButton {
+            min-width: 70px;
+        }
+    """
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        """Форматирует прошедшее время в вид ММ:СС."""
+        s = max(0, int(seconds))
+        m, s = divmod(s, 60)
+        if m > 99:
+            m = 99
+        return f"{m:02d}:{s:02d}"
+
+    def _create_progress_dialog(
+        self,
+        title: str,
+        label_text: str,
+        maximum: int = 0,
+        min_duration_ms: int = 0,
+    ) -> QtWidgets.QProgressDialog:
+        """Создаёт прогресс-диалог в едином стиле приложения. Показывается сразу при min_duration_ms=0."""
+        dlg = QtWidgets.QProgressDialog(label_text, "Отмена", 0, maximum, self)
+        dlg._base_title = title  # type: ignore[attr-defined]
+        dlg.setWindowTitle(title)
+        dlg.setWindowModality(QtCore.Qt.ApplicationModal)
+        dlg.setMinimumDuration(min_duration_ms)
+        dlg.setStyleSheet(self._PROGRESS_STYLE)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        # Добавляем простой счётчик прошедшего времени в заголовок.
+        dlg._start_time = time.monotonic()  # type: ignore[attr-defined]
+        timer = QtCore.QTimer(dlg)
+        timer.setInterval(1000)
+
+        def _update_title():
+            try:
+                start = getattr(dlg, "_start_time", None)
+                base = getattr(dlg, "_base_title", title)
+                if start is None:
+                    return
+                elapsed = time.monotonic() - float(start)
+                dlg.setWindowTitle(f"{base} — {MainWindow._format_elapsed(elapsed)}")
+            except Exception:
+                timer.stop()
+
+        timer.timeout.connect(_update_title)
+        timer.start()
+        dlg.finished.connect(timer.stop)
+        return dlg
 
     def _init_menu(self):
         menu = self.menuBar()
@@ -104,6 +334,11 @@ class MainWindow(QtWidgets.QMainWindow):
         ]:
             action = calc_menu.addAction(name)
             action.triggered.connect(lambda _checked=False, n=name: self._open_calculation_dialog(n))
+
+        settings_menu = menu.addMenu("Настройки")
+        load_mode_action = settings_menu.addAction("Режим загрузки")
+        load_mode_action.setToolTip("Настроить, как загружать большие файлы: по одному графику или весь файл сразу")
+        load_mode_action.triggered.connect(self._show_load_mode_dialog)
 
     def _init_chart_toolbar(self):
         """Панель с кнопками управления графиками справа (рядом с Файл/Расчеты)."""
@@ -150,7 +385,18 @@ class MainWindow(QtWidgets.QMainWindow):
         plots = []
         if hasattr(self.right, "_plots"):
             for order, idx in enumerate(sorted(self.right._plots.keys())):
-                plots.append((idx, f"График {order + 1}"))
+                # Стараться использовать осмысленные имена рядов из исходных файлов.
+                src = self._plot_index_to_source.get(idx)
+                if src:
+                    path, series_name = src
+                    try:
+                        fname = Path(path).name
+                    except Exception:
+                        fname = str(path)
+                    label = f"{fname} — {series_name}"
+                else:
+                    label = f"График {order + 1}"
+                plots.append((idx, label))
         return plots
 
     def get_plot_series_data(self, plot_idx: int):
@@ -266,24 +512,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.right.set_x_range_direct(float(x_min), float(x_max))
             return
 
-        # Восстанавливаем графики по порядку: загрузка данных и добавление с сохранённой геометрией стика
-        progress_dlg = QtWidgets.QProgressDialog("Восстановление проекта...", "Отмена", 0, len(plots), self)
-        progress_dlg.setWindowTitle("Открытие проекта")
-        progress_dlg.setMinimumDuration(300)
-        progress_dlg.setWindowModality(QtCore.Qt.ApplicationModal)
+        # Восстанавливаем графики в фоновом потоке с прогрессом (без зависания на больших файлах)
+        progress_dlg = self._create_progress_dialog("Открытие проекта", "Восстановление проекта...", len(plots) * 1000, 0)
+        worker = _RestoreProjectWorker(plots, self._providers)
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        event_loop = QtCore.QEventLoop()
 
-        for i, plot in enumerate(plots):
-            progress_dlg.setValue(i)
-            progress_dlg.setLabelText(f"Загрузка ряда {i + 1}/{len(plots)}...")
-            QtWidgets.QApplication.processEvents()
-            if progress_dlg.wasCanceled():
-                break
-
-            path_str = plot.get("source_path", "")
-            series_name = plot.get("series_name", "")
-            stick_override = plot.get("stick")
+        def on_one_series(path_str: str, series_name: str, x_data, y_data, stick_override):
             file_path = Path(path_str)
-
             desc = None
             for entry in self._datasets:
                 if entry["path"] == file_path:
@@ -292,24 +529,31 @@ class MainWindow(QtWidgets.QMainWindow):
                             desc = s
                             break
                     break
-            if not desc:
-                continue
+            if desc is not None:
+                try:
+                    self._finalize_added_series(desc, x_data, y_data, stick_override=stick_override)
+                except Exception as e:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Ошибка",
+                        f"Не удалось добавить ряд «{series_name}» из {file_path.name}\n\n{e}"
+                    )
 
-            provider = self._providers.get(file_path)
-            if not provider:
-                continue
-            try:
-                x_data = provider.ensure_x_loaded()
-                y_data = provider.load_y(series_name)
-                self._finalize_added_series(desc, x_data, y_data, stick_override=stick_override)
-            except Exception as e:
-                QtWidgets.QMessageBox.warning(
-                    self, "Ошибка",
-                    f"Не удалось загрузить ряд «{series_name}» из {file_path.name}\n\n{e}"
-                )
+        def on_finished(_canceled: bool):
+            thread.quit()
+            event_loop.quit()
+            progress_dlg.close()
 
-        progress_dlg.setValue(len(plots))
-        progress_dlg.close()
+        worker.progress_value.connect(progress_dlg.setValue)
+        worker.progress_label.connect(progress_dlg.setLabelText)
+        worker.progress_range.connect(lambda m: progress_dlg.setRange(0, max(1, m)))
+        worker.one_series_loaded.connect(on_one_series)
+        worker.finished_signal.connect(on_finished)
+        progress_dlg.canceled.connect(worker.request_cancel)
+
+        thread.started.connect(worker.run)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        event_loop.exec_()
 
         view = state.get("view", {})
         if view and hasattr(self.right, "set_x_range_direct"):
@@ -493,10 +737,7 @@ class MainWindow(QtWidgets.QMainWindow):
         use_headers_progress = self._load_mode != "preload_all"
         progress = None
         if use_headers_progress:
-            progress = QtWidgets.QProgressDialog("Чтение заголовков...", "Отмена", 0, len(filepaths), self)
-            progress.setWindowTitle("Импорт файлов")
-            progress.setWindowModality(QtCore.Qt.ApplicationModal)
-            progress.setMinimumDuration(300)
+            progress = self._create_progress_dialog("Импорт файлов", "Чтение заголовков...", len(filepaths), 0)
         for i, file_path in enumerate(filepaths):
             try:
                 if progress is not None:
@@ -582,12 +823,9 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         # Запускаем загрузку X/Y в фоновом потоке, чтобы не блокировать GUI
-        progress_dlg = QtWidgets.QProgressDialog("Подготовка ряда...", "Отмена", 0, 0, self)
-        progress_dlg.setWindowTitle("Загрузка ряда")
-        progress_dlg.setWindowModality(QtCore.Qt.ApplicationModal)
-        progress_dlg.setMinimumDuration(200)
-        progress_dlg.setAutoClose(True)
-        progress_dlg.setLabelText(f"Подготовка «{desc['name']}»...")
+        progress_dlg = self._create_progress_dialog(
+            "Загрузка ряда", f"Подготовка «{desc['name']}»...", 0, 0
+        )
 
         class LoadSeriesWorker(QtCore.QObject):
             finished = QtCore.pyqtSignal(object, object, object)  # x, y, err
@@ -786,10 +1024,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not plot_data:
             return
         # ????????? ???????? ?? ???? (??? ??????)
-        pdialog = QtWidgets.QProgressDialog("Перенос графика на диск...", "", 0, 0, self)
-        pdialog.setWindowTitle("Оптимизация памяти")
-        pdialog.setWindowModality(QtCore.Qt.ApplicationModal)
-        pdialog.setMinimumDuration(0)
+        pdialog = self._create_progress_dialog("Оптимизация памяти", "Перенос графика на диск...", 0, 0)
         QtWidgets.QApplication.processEvents()
         x_data = plot_data['x_data']
         y_data = plot_data['y_data']
@@ -849,28 +1084,66 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             super().closeEvent(event)
 
-    # --- Optimization UI ---
-    def _show_optimization_mode_dialog(self):
+    # --- Настройки: режим загрузки (сохраняется в QSettings) ---
+    def _show_load_mode_dialog(self):
         dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Режим оптимизации")
+        dlg.setWindowTitle("Режим загрузки")
+        dlg.setMinimumWidth(420)
         lay = QtWidgets.QVBoxLayout(dlg)
-        rb_lazy = QtWidgets.QRadioButton("Подгружать по одному графику (рекомендовано)")
-        rb_pre = QtWidgets.QRadioButton("Выгружать все серии сразу (дольше старт, больше I/O)")
-        rb_lazy.setChecked(self._load_mode == "lazy")
-        rb_pre.setChecked(self._load_mode == "preload_all")
-        lay.addWidget(rb_lazy); lay.addWidget(rb_pre)
+
+        grp = QtWidgets.QGroupBox("Как загружать большие файлы")
+        grp_lay = QtWidgets.QVBoxLayout(grp)
+        self._rb_lazy_load = QtWidgets.QRadioButton("По одному графику")
+        self._rb_lazy_load.setToolTip("Данные читаются только при добавлении ряда на график")
+        self._rb_preload = QtWidgets.QRadioButton("Весь файл сразу")
+        self._rb_preload.setToolTip("При открытии файла выгружать все ряды в память")
+        self._rb_lazy_load.setChecked(self._load_mode == "lazy")
+        self._rb_preload.setChecked(self._load_mode == "preload_all")
+        grp_lay.addWidget(self._rb_lazy_load)
+        grp_lay.addWidget(self._rb_preload)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(grp)
+        btn_help = QtWidgets.QPushButton("?")
+        btn_help.setFixedSize(28, 28)
+        btn_help.setToolTip("Подробнее о режимах")
+        btn_help.clicked.connect(lambda: self._show_load_mode_help())
+        row.addWidget(btn_help, alignment=QtCore.Qt.AlignTop)
+        lay.addLayout(row)
+
         btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
         lay.addWidget(btns)
-        btns.accepted.connect(dlg.accept); btns.rejected.connect(dlg.reject)
+
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            self._load_mode = "preload_all" if rb_pre.isChecked() else "lazy"
+            self._load_mode = "preload_all" if self._rb_preload.isChecked() else "lazy"
             self._save_user_settings()
             if self._load_mode == "preload_all":
-                ans = QtWidgets.QMessageBox.question(self, "Предзагрузка",
-                    "Предзагрузить сразу все серии для уже импортированных файлов?",
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+                ans = QtWidgets.QMessageBox.question(
+                    self,
+                    "Предзагрузка",
+                    "Предзагрузить все серии для уже открытых файлов сейчас?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
                 if ans == QtWidgets.QMessageBox.Yes:
                     self._preload_all_series()
+
+    def _show_load_mode_help(self):
+        QtWidgets.QMessageBox.information(
+            self,
+            "Режимы загрузки",
+            "<p><b>По одному графику</b></p>"
+            "<p>При открытии файла в список попадают только названия рядов. Данные с диска читаются "
+            "только когда вы добавляете конкретный ряд на график. Быстрый старт, меньше памяти, "
+            "но каждое добавление графика может занять время на больших файлах.</p>"
+            "<p><b>Весь файл сразу</b></p>"
+            "<p>При открытии файла все ряды выгружаются в память (или на диск через memory-mapping). "
+            "Открытие дольше, зато добавление любого графика потом происходит мгновенно. "
+            "Удобно, когда нужно часто переключаться между многими рядами одного файла.</p>"
+            "<p>Выбор сохраняется и действует при следующем запуске.</p>",
+        )
 
     def _preload_all_series(self):
         # ???????????? ?? ?????? ? ????????? ?????????? ?? ?????? ????
@@ -892,105 +1165,37 @@ class MainWindow(QtWidgets.QMainWindow):
         # ??????? ????????? ????????: ??????? ?????????? ?????? ?????, ????? ????????? ??????
         local_progress = progress
         if local_progress is None:
-            local_progress = QtWidgets.QProgressDialog(f"{file_path.name}: инициализация...", "Отмена", 0, 0, self)
-            local_progress.setWindowTitle("Предзагрузка файла")
-            local_progress.setWindowModality(QtCore.Qt.ApplicationModal)
-            local_progress.setMinimumDuration(0)
+            local_progress = self._create_progress_dialog(
+                "Предзагрузка файла", f"{file_path.name}: подготовка...", 0, 0
+            )
             local_progress.setValue(0)
-            QtWidgets.QApplication.processEvents()
 
         # ?????? ?????????? ????? (????? ?????? ?????) ? ?????????? ?????? ?????
-        local_progress.setLabelText(f"{file_path.name}: оценка объёма данных...")
-        QtWidgets.QApplication.processEvents()
+        # Переносим всю тяжёлую работу в фоновый поток — GUI не зависает
+        worker = _PreloadWorker(provider, file_path, series_list)
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        event_loop = QtCore.QEventLoop()
 
-        total_rows = 0
-        try:
-            if hasattr(provider, "estimate_rows"):
-                total_rows = int(provider.estimate_rows())
-            else:
-                # ????????? ???????? ????? X (????? ???? ?????? ??? ????????? ????????)
-                x_tmp = provider.ensure_x_loaded()
-                try:
-                    total_rows = len(x_tmp)
-                except Exception:
-                    total_rows = 0
-        except InterruptedError:
-            # ???????????? ??????? ?? ????? ?????? ? ?????????
-            if progress is None and local_progress is not None:
+        def on_finished(_canceled: bool):
+            thread.quit()
+            event_loop.quit()
+            if progress is None:
                 local_progress.close()
-            return True
-        except Exception:
-            total_rows = 0
 
-        # ?????? ????? ?????????? ?????? ???????? ?????????
-        units_total = total_rows * (1 + len(series_list))
-        if units_total > 0:
-            local_progress.setRange(0, units_total)
-            local_progress.setValue(0)
-        else:
-            local_progress.setRange(0, 0)
-        QtWidgets.QApplication.processEvents()
+        worker.progress_value.connect(local_progress.setValue)
+        worker.progress_label.connect(local_progress.setLabelText)
+        worker.progress_range.connect(lambda m: local_progress.setRange(0, max(1, m)))
+        worker.finished_signal.connect(on_finished)
+        if progress is None:
+            local_progress.canceled.connect(worker.request_cancel)
 
-        # ?????????????? X
-        try:
-            if local_progress:
-                local_progress.setLabelText(f"{file_path.name}: Подготовка X...")
-                QtWidgets.QApplication.processEvents()
-            # ???????? ?? X: ??????? offset = 0
-            base_offset = 0
-            def cb_x(done, total, label):
-                if local_progress and units_total > 0:
-                    # done ??? ? "???????"
-                    local_progress.setValue(base_offset + int(done))
-                    local_progress.setLabelText(f"{file_path.name}: X {done}/{total} ({int((done/max(1,total))*100)}%)")
-                    QtWidgets.QApplication.processEvents()
-            provider.ensure_x_loaded(progress=cb_x, total_hint=total_rows or None)
-        except InterruptedError:
-            # ?????? ?????????????
-            if progress is None and local_progress is not None:
-                local_progress.close()
-            return True
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(self, "Ошибка", f"Не удалось подготовить X для {file_path}\n\n{e}")
-            if progress is None and local_progress is not None:
-                local_progress.close()
-            return False
+        thread.started.connect(worker.run)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        event_loop.exec_()
 
-        # ??? ?????? ????? ? ??????????? Y (??????????? offset)
-        base_offset = total_rows if total_rows > 0 else 0
-        for desc in series_list:
-            if local_progress and local_progress.wasCanceled():
-                try:
-                    if hasattr(provider, "request_cancel"):
-                        provider.request_cancel()
-                except Exception:
-                    pass
-                if progress is None and local_progress is not None:
-                    local_progress.close()
-                return True
-            if local_progress:
-                local_progress.setLabelText(f"{file_path.name}: {desc['name']}?")
-                QtWidgets.QApplication.processEvents()
-            try:
-                def cb_y(done, total, label):
-                    if local_progress and units_total > 0:
-                        local_progress.setValue(base_offset + int(done))
-                        local_progress.setLabelText(f"{file_path.name}: {desc['name']} {done}/{total} ({int((done/max(1,total))*100)}%)")
-                        QtWidgets.QApplication.processEvents()
-                provider.load_y(desc['name'], progress=cb_y, total_hint=total_rows or None)
-                base_offset += (total_rows if total_rows > 0 else 0)
-            except InterruptedError:
-                if progress is None and local_progress is not None:
-                    local_progress.close()
-                return True
-            except Exception as e:
-                QtWidgets.QMessageBox.warning(self, "Ошибка", f"Не удалось подготовить «{desc['name']}»\n{file_path}\n\n{e}")
-                continue
-        if local_progress and units_total > 0:
-            local_progress.setValue(units_total)
-        if progress is None and local_progress is not None:
-            local_progress.close()
-        return False
+        return worker._canceled
 
     def _rollback_new_imports(self, file_paths: List[Path]):
         # ??????? datasets ? ?????????? ??????????? ? ???? ???????
@@ -1143,7 +1348,7 @@ class TensometryDialog(QtWidgets.QDialog):
         # --- Параметры ---
         grp_params = QtWidgets.QGroupBox("Параметры")
         params_lay = QtWidgets.QHBoxLayout(grp_params)
-        params_lay.addWidget(QtWidgets.QLabel("Показатель Минера (m):"))
+        params_lay.addWidget(QtWidgets.QLabel("Показатель кривой Вёлера (m):"))
         self._miner_spin = QtWidgets.QDoubleSpinBox()
         self._miner_spin.setRange(2.0, 20.0)
         self._miner_spin.setValue(5.0)
@@ -1238,7 +1443,7 @@ class TensometryDialog(QtWidgets.QDialog):
             f"  Макс. полуразмах: {r.max_half_range:.6g}",
             f"  Мин. квазистатическое: {r.min_quasi_static:.6g}",
             f"  Макс. квазистатическое: {r.max_quasi_static:.6g}",
-            f"  Эквив. полуразмах (Минера): {r.equivalent_half_range:.6g}",
+            f"  Эквив. полуразмах (кривая Вёлера): {r.equivalent_half_range:.6g}",
             "",
         ]
         self._results_text.append("\n".join(block))

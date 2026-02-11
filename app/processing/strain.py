@@ -106,25 +106,42 @@ def _find_local_extrema(y: np.ndarray, min_prominence: float | None) -> List[Tup
     if n < 3:
         return []
 
+    # Значения проминентности по умолчанию — 1% от размаха по всему участку.
     if min_prominence is None:
         span = np.nanmax(y) - np.nanmin(y)
         min_prominence = (span * 0.01) if span > 0 else 0.0
 
-    result: List[Tuple[int, str]] = []
+    y = np.asarray(y, dtype=float)
+    y0 = y[:-2]
+    y1 = y[1:-1]
+    y2 = y[2:]
 
-    for i in range(1, n - 1):
-        if not np.isfinite(y[i]):
-            continue
-        if y[i] >= y[i - 1] and y[i] >= y[i + 1]:
-            # локальный максимум
-            if min_prominence <= 0 or (y[i] - max(y[i - 1], y[i + 1]) >= min_prominence):
-                result.append((i, "max"))
-        elif y[i] <= y[i - 1] and y[i] <= y[i + 1]:
-            # локальный минимум
-            if min_prominence <= 0 or (min(y[i - 1], y[i + 1]) - y[i] >= min_prominence):
-                result.append((i, "min"))
+    # Маска валидных тройек (без NaN/inf), чтобы не городить сложные проверки в питоне.
+    valid = np.isfinite(y0) & np.isfinite(y1) & np.isfinite(y2)
 
-    return result
+    # Локальные максимумы и минимумы векторно.
+    is_max = (y1 >= y0) & (y1 >= y2)
+    is_min = (y1 <= y0) & (y1 <= y2)
+
+    # Проминентность
+    max_prom = y1 - np.maximum(y0, y2)
+    min_prom = np.minimum(y0, y2) - y1
+
+    max_mask = valid & is_max & ((min_prominence <= 0) | (max_prom >= min_prominence))
+    min_mask = valid & is_min & ((min_prominence <= 0) | (min_prom >= min_prominence))
+
+    idx_base = np.arange(1, n - 1)
+    max_idx = idx_base[max_mask]
+    min_idx = idx_base[min_mask]
+
+    # Объединяем и сортируем по возрастанию индекса, сохраняя тип экстремума.
+    kinds: List[Tuple[int, str]] = []
+    for i in max_idx:
+        kinds.append((int(i), "max"))
+    for i in min_idx:
+        kinds.append((int(i), "min"))
+    kinds.sort(key=lambda t: t[0])
+    return kinds
 
 
 def _cycles_from_extrema(
