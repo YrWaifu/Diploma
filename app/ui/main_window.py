@@ -321,8 +321,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.right.set_x_zero_to_data_max(padding_ratio=0.02)
 
     def _save_project(self) -> bool:
-        """Сохраняет проект. Возвращает True, если сохранение выполнено (или не требовалось)."""
-        if self._project_path is not None and self._project_path.exists():
+        """Сохраняет проект в текущий файл (перезапись) или открывает «Сохранить как», если путь не задан."""
+        if self._project_path is not None:
             state = self.get_project_state()
             try:
                 save_project(state, self._project_path)
@@ -336,16 +336,16 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._save_project_as()
 
     def _save_project_as(self) -> bool:
-        """Сохранить как... Возвращает True, если файл сохранён."""
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Сохранить проект",
-            "",
-            "Все файлы (*.*);;Проект SecSig (*.secsig)",
-        )
-        if not path:
+        """Сохранить как... Возвращает True, если файл сохранён. Расширение .secsig подставляется автоматически."""
+        dlg = QtWidgets.QFileDialog(self, "Сохранить проект", "", "Все файлы (*.*);;Проект SecSig (*.secsig)")
+        dlg.setAcceptMode(QtWidgets.QFileDialog.AcceptSave)
+        dlg.setDefaultSuffix("secsig")
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return False
-        path = Path(path)
+        paths = dlg.selectedFiles()
+        if not paths:
+            return False
+        path = Path(paths[0])
         if path.suffix.lower() != PROJECT_EXT:
             path = path.with_suffix(PROJECT_EXT)
         state = self.get_project_state()
