@@ -68,11 +68,17 @@ class XZoomViewBox(pg.ViewBox):
 class DataPlot(pg.PlotWidget):
     sigXHalfRangeChanged = QtCore.pyqtSignal(float)
     sigCursorMoved = QtCore.pyqtSignal(float, int)
+    # Сигнал: списки времён начала и окончания режимов обновились (после перетаскивания линии).
+    sigModeTimesChanged = QtCore.pyqtSignal(list, list)
 
     def __init__(self, parent=None):
         self.vb = XZoomViewBox()
         self._curves: dict[int, pg.PlotDataItem] = {}
         self._plots: dict[int, dict] = {}
+        self._mode_lines_start: list[pg.InfiniteLine] = []
+        self._mode_lines_end: list[pg.InfiniteLine] = []
+        self._mode_off_regions: list[pg.LinearRegionItem] = []
+        self._labels: dict[int, pg.TextItem] = {}
         self._x_half_range = 10.0
         self._x_min = 0.0
         self._x_max = 20.0
@@ -181,6 +187,14 @@ class DataPlot(pg.PlotWidget):
             self.removeItem(c)
         self._curves.clear()
         self._plots.clear()
+        # Удаляем режимные маркеры и подписи, если они есть
+        self.clear_mode_markers()
+        for lbl in self._labels.values():
+            try:
+                self.removeItem(lbl)
+            except Exception:
+                pass
+        self._labels.clear()
 
     def _on_mouse_moved(self, pos):
         if self.sceneBoundingRect().contains(pos):
@@ -257,6 +271,8 @@ class DataPlot(pg.PlotWidget):
         y_data_span = max(1e-9, y_max - y_min)
         ys = y_top + ((y_max - y_vis) / y_data_span) * span
         self._curves[idx].setData(x_vis, ys, antialias=False)
+        # Обновляем положение подписи графика (если есть)
+        self._update_label_position(idx)
 
     def set_x_zero_to_data_max(self, padding_ratio: float = 0.02):
         if not self._plots:
@@ -278,3 +294,183 @@ class DataPlot(pg.PlotWidget):
         span = max(1e-12, xmax - 0.0)
         pad_right = span * float(padding_ratio)
         self.set_x_range_direct(0.0, xmax + pad_right)
+
+    # --- режимный график / маркеры ---
+    def clear_mode_markers(self):
+        """Удаляет все вертикальные линии и области, связанные с режимами."""
+        for ln in self._mode_lines_start:
+            try:
+                self.removeItem(ln)
+            except Exception:
+                pass
+        for ln in self._mode_lines_end:
+            try:
+                self.removeItem(ln)
+            except Exception:
+                pass
+        self._mode_lines_start.clear()
+        self._mode_lines_end.clear()
+        for r in self._mode_off_regions:
+            try:
+                self.removeItem(r)
+            except Exception:
+                pass
+        self._mode_off_regions.clear()
+
+    def add_mode_markers(self, start_times: list[float], end_times: list[float]):
+        """
+        Добавляет вертикальные линии на моменты начала/окончания режима.
+
+        start_times — начала (синие линии),
+        end_times — окончания (красные линии).
+        """
+        self.clear_mode_markers()
+        # Синие — начало режима (перетаскиваемые)
+        pen_start = pg.mkPen((50, 100, 200, 200), width=2, style=QtCore.Qt.DashLine)
+        hover_start = pg.mkPen((30, 70, 220, 255), width=3, style=QtCore.Qt.SolidLine)
+        for t in start_times:
+            try:
+                ln = pg.InfiniteLine(pos=float(t), angle=90, movable=True,
+                                     pen=pen_start, hoverPen=hover_start)
+                ln.sigPositionChangeFinished.connect(self._on_mode_line_moved)
+                self.addItem(ln)
+                self._mode_lines_start.append(ln)
+            except Exception:
+                continue
+        # Красные — окончание режима (перетаскиваемые)
+        pen_end = pg.mkPen((200, 60, 60, 200), width=2, style=QtCore.Qt.DashLine)
+        hover_end = pg.mkPen((220, 30, 30, 255), width=3, style=QtCore.Qt.SolidLine)
+        for t in end_times:
+            try:
+                ln = pg.InfiniteLine(pos=float(t), angle=90, movable=True,
+                                     pen=pen_end, hoverPen=hover_end)
+                ln.sigPositionChangeFinished.connect(self._on_mode_line_moved)
+                self.addItem(ln)
+                self._mode_lines_end.append(ln)
+            except Exception:
+                continue
+
+        self._rebuild_mode_regions()
+
+    def _get_mode_times(self) -> tuple[list[float], list[float]]:
+        """Считывает текущие позиции линий-маркеров режимов."""
+        starts = sorted(float(ln.value()) for ln in self._mode_lines_start)
+        ends = sorted(float(ln.value()) for ln in self._mode_lines_end)
+        return starts, ends
+
+    def get_mode_times(self) -> tuple[list[float], list[float]]:
+        """Публичный доступ к актуальным временам начала/окончания режимов."""
+        return self._get_mode_times()
+
+    def _on_mode_line_moved(self):
+        """Обработчик окончания перетаскивания любой режимной линии."""
+        self._rebuild_mode_regions()
+        starts, ends = self._get_mode_times()
+        self.sigModeTimesChanged.emit(starts, ends)
+
+    def _rebuild_mode_regions(self):
+        """Перестраивает серые области «выключенного режима» по текущим позициям линий."""
+        # Удаляем старые регионы
+        for r in self._mode_off_regions:
+            try:
+                self.removeItem(r)
+            except Exception:
+                pass
+        self._mode_off_regions.clear()
+
+        starts, ends = self._get_mode_times()
+        if not starts and not ends:
+            return
+
+        try:
+            # Собираем все события на временной оси
+            events: list[tuple[str, float]] = []
+            for s in starts:
+                events.append(('s', s))
+            for e in ends:
+                events.append(('e', e))
+            events.sort(key=lambda ev: ev[1])
+
+            # Определяем границы данных по X
+            x_lo = self._x_min
+            x_hi = self._x_max
+            if self._plots:
+                x_arr_mins: list[float] = []
+                x_arr_maxs: list[float] = []
+                for p in self._plots.values():
+                    xa = np.asarray(p['x_data'])
+                    if xa.size:
+                        x_arr_mins.append(float(xa[0]))
+                        x_arr_maxs.append(float(xa[-1]))
+                if x_arr_mins:
+                    x_lo = min(x_lo, min(x_arr_mins))
+                if x_arr_maxs:
+                    x_hi = max(x_hi, max(x_arr_maxs))
+
+            # Формируем интервалы «на минимуме».
+            plateau: list[tuple[float, float]] = []
+            if events[0][0] == 's' and events[0][1] > x_lo:
+                plateau.append((x_lo, events[0][1]))
+
+            for k in range(len(events) - 1):
+                if events[k][0] == 'e' and events[k + 1][0] == 's':
+                    a, b = events[k][1], events[k + 1][1]
+                    if b > a:
+                        plateau.append((a, b))
+
+            if events[-1][0] == 'e' and events[-1][1] < x_hi:
+                plateau.append((events[-1][1], x_hi))
+
+            if not plateau:
+                return
+
+            brush = pg.mkBrush(210, 210, 210, 120)
+            pen_none = pg.mkPen(None)
+            for a, b in plateau:
+                if b <= a:
+                    continue
+                region = pg.LinearRegionItem(
+                    values=(a, b),
+                    orientation=pg.LinearRegionItem.Vertical,
+                    movable=False,
+                    brush=brush,
+                )
+                region.setZValue(5)
+                for line in region.lines:
+                    line.setPen(pen_none)
+                    line.setHoverPen(pen_none)
+                    line.setMovable(False)
+                self.addItem(region)
+                self._mode_off_regions.append(region)
+        except Exception:
+            return
+
+    # --- подписи графиков справа ---
+    def set_plot_label(self, idx: int, text: str, color) -> None:
+        """Создаёт или обновляет подпись графика вдоль шкалы справа."""
+        if idx not in self._plots:
+            return
+        if idx not in self._labels:
+            lbl = pg.TextItem(text=text, anchor=(1.0, 0.5))
+            self._labels[idx] = lbl
+            self.addItem(lbl)
+        else:
+            lbl = self._labels[idx]
+            lbl.setText(text)
+        try:
+            lbl.setColor(color)
+        except Exception:
+            pass
+        self._update_label_position(idx)
+
+    def _update_label_position(self, idx: int) -> None:
+        """Обновляет положение подписи для заданного графика по текущему виду."""
+        if idx not in self._labels or idx not in self._plots:
+            return
+        plot_data = self._plots[idx]
+        y_top, y_bot = plot_data["y_top"], plot_data["y_bottom"]
+        y_center = 0.5 * (y_top + y_bot)
+        span_x = max(1e-6, float(self._x_max - self._x_min))
+        x_pos = float(self._x_max - 0.02 * span_x)
+        # Пытаемся просто поставить подпись в нужное место; ошибки здесь не критичны.
+        self._labels[idx].setPos(x_pos, y_center)

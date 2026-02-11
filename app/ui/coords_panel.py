@@ -17,7 +17,8 @@ class CoordinatesPanel(QtWidgets.QWidget):
         self.setPalette(pal)
 
     def update_stick_data(self, idx: int, color: QtGui.QColor, data_min: float, data_max: float,
-                          y_pixel_top: int, y_pixel_bottom: int, x_data, y_data):
+                          y_pixel_top: int, y_pixel_bottom: int, x_data, y_data,
+                          name: str = ""):
         self._sticks_data[idx] = {
             'color': color,
             'data_min': data_min,
@@ -26,6 +27,7 @@ class CoordinatesPanel(QtWidgets.QWidget):
             'y_pixel_bottom': y_pixel_bottom,
             'x_data': x_data,
             'y_data': y_data,
+            'name': name,
         }
         self.update()
 
@@ -77,6 +79,8 @@ class CoordinatesPanel(QtWidgets.QWidget):
         p.setFont(font_normal); p.setPen(QtGui.QColor(80, 80, 80))
         p.drawText(10, 45, f"X: {self._cursor_x:.4f}")
         y_offset = 70
+        avail_w = max(40, self.width() - 28 - 6)  # ширина, доступная для текста
+        fm = p.fontMetrics()
         for idx in sorted(self._sticks_data.keys()):
             data = self._sticks_data[idx]
             color = data['color']
@@ -84,9 +88,14 @@ class CoordinatesPanel(QtWidgets.QWidget):
             p.setPen(QtCore.Qt.NoPen); p.setBrush(QtGui.QBrush(color))
             p.drawRect(10, y_offset - 8, 12, 12)
             p.setPen(color); p.setFont(font_normal)
-            text = f"График {idx + 1}: {y_value:.4f}" if y_value is not None else f"График {idx + 1}: ---"
-            p.drawText(28, y_offset + 3, text)
+            series_name = data.get('name') or f"График {idx + 1}"
+            # Имя ряда — отдельной строкой, сокращённое при необходимости.
+            elided_name = fm.elidedText(series_name, QtCore.Qt.ElideMiddle, avail_w)
+            p.drawText(28, y_offset + 3, elided_name)
+            # Значение под именем.
+            val_text = f"{y_value:.4f}" if y_value is not None else "---"
+            p.drawText(28, y_offset + 18, val_text)
             p.setPen(QtGui.QColor(120, 120, 120))
-            range_text = f"  [{data['data_min']:.2g} ... {data['data_max']:.2g}]"
-            p.drawText(28, y_offset + 18, range_text)
-            y_offset += 40
+            range_text = f"[{data['data_min']:.2g} … {data['data_max']:.2g}]"
+            p.drawText(28, y_offset + 33, range_text)
+            y_offset += 52

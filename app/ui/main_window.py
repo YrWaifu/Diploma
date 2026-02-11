@@ -8,6 +8,7 @@ import tempfile
 import time
 
 from app.ui.left_panel import DotsCanvas, Stick
+from app.ui.mode_dialog import ModeDialog
 from app.ui.plot import DataPlot
 from app.ui.coords_panel import CoordinatesPanel
 from app.io.series_provider import make_series_provider
@@ -18,6 +19,7 @@ from app.processing import (
     compute_vibrometry,
     VibrometryResult,
     estimate_fs_from_time,
+    detect_mode_switches,
 )
 
 
@@ -215,12 +217,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._project_path: Path | None = None
         # проект изменён после последнего сохранения (для подтверждения при закрытии)
         self._project_dirty: bool = False
+        # Актуальные времена режимных переключений (обновляются при анализе и перетаскивании).
+        self._mode_start_times: List[float] = []
+        self._mode_end_times: List[float] = []
 
         # загрузка пользовательских настроек
         self._load_user_settings()
 
         self.left.stickUpdated.connect(self.on_stick_updated)
         self.right.sigCursorMoved.connect(self.coords.update_cursor_position)
+        self.right.sigModeTimesChanged.connect(self._on_mode_times_changed)
 
         layout.addWidget(self.left, 1)
         layout.addWidget(self.right, 4)
@@ -327,7 +333,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         calc_menu = menu.addMenu("Расчеты")
         for name in [
-            "Выгрузить и отобразить",
+            "Режим (выгрузить и отобразить)",
             "Калькулятор",
             "Тензометрирование (прочность)",
             "Виброметрирование (вибрации)",
@@ -416,15 +422,70 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return (x, y)
 
+    def _build_mode_items(self) -> list[dict]:
+        """
+        Строит список всех рядов для режима: как уже отрисованных, так и ещё не добавленных.
+        Каждый элемент: {label, plot_idx (или None), file, series_name}.
+        """
+        items: list[dict] = []
+        # Обратная карта: (path, series_name) -> plot_idx
+        reverse: dict[tuple[Path, str], int] = {}
+        for idx, src in self._plot_index_to_source.items():
+            path, series_name = src
+            try:
+                p = Path(path)
+            except Exception:
+                continue
+            reverse[(p.resolve(), series_name)] = idx
+
+        for entry in self._datasets:
+            file_path: Path = entry["path"]
+            for desc in entry.get("series", []):
+                name = desc.get("name")
+                if not name:
+                    continue
+                key = (file_path.resolve(), name)
+                plot_idx = reverse.get(key)
+                label = f"{file_path.name} — {name}"
+                items.append(
+                    {
+                        "label": label,
+                        "plot_idx": plot_idx,
+                        "file": str(file_path),
+                        "series_name": name,
+                    }
+                )
+        return items
+
     def _open_calculation_dialog(self, title: str):
-        plots = self._get_active_plots()
         if title == "Тензометрирование (прочность)":
+            plots = self._get_active_plots()
             dlg = TensometryDialog(plots, self)
+            dlg.exec_()
         elif title == "Виброметрирование (вибрации)":
+            plots = self._get_active_plots()
             dlg = VibrometryDialog(plots, self)
+            dlg.exec_()
+        elif title.startswith("Режим"):
+            # Упрощённый сценарий: выбор одного ряда и сразу отрисовка режимного графика.
+            items = self._build_mode_items()
+            if not items:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Нет данных",
+                    "Нет доступных рядов для анализа режима. Сначала загрузите данные.",
+                )
+                return
+            dlg = ModeDialog(items, self)
+            dlg.exec_()
         else:
-            dlg = CalculationDialog(title, plots, self)
-        dlg.exec_()
+            # Прочие расчёты используют универсальный диалог.
+            items = [
+                {"label": label, "plot_idx": idx, "file": None, "series_name": None}
+                for idx, label in self._get_active_plots()
+            ]
+            dlg = CalculationDialog(title, items, self)
+            dlg.exec_()
 
     def get_project_state(self) -> Dict[str, Any]:
         """Состояние проекта для сохранения: источники, графики (путь + ряд + стик), вид по X."""
@@ -466,7 +527,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self.right, "_x_min") and hasattr(self.right, "_x_max"):
             view = {"x_min": float(self.right._x_min), "x_max": float(self.right._x_max)}
 
-        return {"version": 1, "sources": sources, "plots": plots, "view": view}
+        # Режимные маркеры (если пользователь запускал анализ режима).
+        mode_markers = {}
+        if self._mode_start_times or self._mode_end_times:
+            mode_markers = {
+                "start_times": [float(t) for t in self._mode_start_times],
+                "end_times": [float(t) for t in self._mode_end_times],
+            }
+
+        return {"version": 1, "sources": sources, "plots": plots, "view": view,
+                "mode_markers": mode_markers}
 
     def apply_project_state(self, state: Dict[str, Any]) -> None:
         """Восстанавливает workspace из сохранённого состояния. Данные подгружаются из файлов."""
@@ -563,6 +633,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.right.set_x_range_direct(float(x_min), float(x_max))
             elif getattr(self.right, "_plots", {}):
                 self.right.set_x_zero_to_data_max(padding_ratio=0.02)
+
+        # Восстанавливаем режимные маркеры (перетаскиваемые палки).
+        mode_markers = state.get("mode_markers", {})
+        if mode_markers:
+            starts = mode_markers.get("start_times", [])
+            ends = mode_markers.get("end_times", [])
+            if starts or ends:
+                self._mode_start_times = [float(t) for t in starts]
+                self._mode_end_times = [float(t) for t in ends]
+                try:
+                    self.right.add_mode_markers(self._mode_start_times, self._mode_end_times)
+                except Exception:
+                    pass
 
     def _save_project(self) -> bool:
         """Сохраняет проект в текущий файл (перезапись) или открывает «Сохранить как», если путь не задан."""
@@ -945,11 +1028,14 @@ class MainWindow(QtWidgets.QMainWindow):
             avail_w = max(1, self.left.width() - margin * 2 - 60)
             x = int(margin + 30 + (idx * 40) % max(1, avail_w))
 
-        new_stick = Stick(x, y1, y2, color, data_min, data_max)
+        # На шкале слева — только имя ряда, на панели координат — файл + ряд.
+        new_stick = Stick(x, y1, y2, color, data_min, data_max, desc['name'])
         idx_added = self.left.add_stick(new_stick)
 
+        full_label = f"{file_path.name} — {desc['name']}"
         self.right.add_or_update_plot(idx_added, x_data, y_data, y1, y2, color, y_min=data_min, y_max=data_max)
-        self.coords.update_stick_data(idx_added, color, data_min, data_max, y1, y2, x_data, y_data)
+        self.coords.update_stick_data(idx_added, color, data_min, data_max, y1, y2, x_data, y_data,
+                                      name=full_label)
         self._plotted_keys.add(desc['key'])
         self._plot_index_to_source[idx_added] = (file_path, desc['name'])
         self._project_dirty = True
@@ -963,13 +1049,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # ???????, ??? ???? ?????? ???????? ? RAM (????)
         self._memory_mru.append(idx_added)
         self._enforce_memory_limit()
+        return idx_added
 
     def on_stick_updated(self, idx: int, y1: int, y2: int):
         self.right.update_plot_v_range(idx, y1, y2)
         if idx in self.coords._sticks_data:
             data = self.coords._sticks_data[idx]
             self.coords.update_stick_data(idx, data['color'], data['data_min'], data['data_max'], y1, y2,
-                                          data['x_data'], data['y_data'])
+                                          data['x_data'], data['y_data'],
+                                          name=data.get('name', ''))
 
     def clear_all(self):
         self.left.clear_all(); self.right.clear_all(); self.coords.clear_all()
@@ -1054,7 +1142,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if idx in self.coords._sticks_data:
                 data = self.coords._sticks_data[idx]
                 self.coords.update_stick_data(idx, data['color'], data['data_min'], data['data_max'],
-                                              y_top, y_bottom, x_data, y_mem)
+                                              y_top, y_bottom, x_data, y_mem,
+                                              name=data.get('name', ''))
             self._plot_tmp_paths[idx] = tmp_path
         except Exception as e:
             # ???? ?? ???????, ?????????? idx ? ????? MRU (??????? ??? ?? ???????? ? RAM)
@@ -1210,6 +1299,144 @@ class MainWindow(QtWidgets.QMainWindow):
                     prov.cleanup()
                 except Exception:
                     pass
+
+    def _ensure_series_plotted_for_mode(self, file_path: Path, series_name: str) -> Optional[int]:
+        """
+        Гарантирует, что заданный ряд (file_path + series_name) добавлен как график.
+        Возвращает индекс графика (plot_idx) или None при ошибке.
+        """
+        # Если уже отрисован — просто возвращаем существующий индекс.
+        for idx, src in self._plot_index_to_source.items():
+            path, name = src
+            try:
+                p = Path(path)
+            except Exception:
+                continue
+            if p.resolve() == file_path.resolve() and name == series_name:
+                return idx
+
+        # Ищем описание ряда в _datasets
+        desc: Optional[Dict] = None
+        for entry in self._datasets:
+            if Path(entry.get("path")).resolve() != file_path.resolve():
+                continue
+            for s in entry.get("series", []):
+                if s.get("name") == series_name:
+                    desc = s
+                    break
+            if desc is not None:
+                break
+
+        if desc is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Ошибка",
+                f"Ряд «{series_name}» для файла {file_path} не найден в загруженных данных.",
+            )
+            return None
+
+        provider = self._providers.get(file_path)
+        if provider is None:
+            try:
+                provider = make_series_provider(file_path)
+                info = provider.list_series()
+                self._providers[file_path] = provider
+                if not any(Path(d.get("path")).resolve() == file_path.resolve() for d in self._datasets):
+                    series_list = []
+                    for name in info.y_names:
+                        key = f"{file_path}|{name}"
+                        series_list.append({"key": key, "file": file_path, "name": name})
+                    self._datasets.append({"path": file_path, "series": series_list, "x_name": info.x_name})
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "Ошибка", f"Не удалось открыть файл\n{file_path}\n\n{e}")
+                return None
+
+        try:
+            x_data = provider.ensure_x_loaded()
+            y_data = provider.load_y(series_name)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Ошибка",
+                f"Не удалось загрузить данные ряда «{series_name}» из файла\n{file_path}\n\n{e}",
+            )
+            return None
+
+        try:
+            idx_added = self._finalize_added_series(desc, x_data, y_data)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Ошибка",
+                f"Не удалось добавить ряд «{series_name}» как график.\n\n{e}",
+            )
+            return None
+
+        return idx_added
+
+    def _run_mode_analysis_for_item(self, item: Dict[str, Any]) -> None:
+        """
+        Выполняет анализ режима для выбранного ряда:
+        - при необходимости добавляет график,
+        - считает моменты переключений,
+        - рисует вертикальные линии на основном графике.
+        """
+        from pathlib import Path as _Path  # локальный импорт, чтобы избежать конфликтов
+
+        if not item:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Не выбран ряд для анализа режима.")
+            return
+
+        plot_idx = item.get("plot_idx")
+        # Если график ещё не отрисован — добавляем его.
+        if plot_idx is None:
+            file_str = item.get("file")
+            series_name = item.get("series_name")
+            if not file_str or not series_name:
+                QtWidgets.QMessageBox.warning(self, "Ошибка", "Недостаточно информации о выбранном ряде.")
+                return
+            file_path = _Path(file_str)
+            new_idx = self._ensure_series_plotted_for_mode(file_path, series_name)
+            if new_idx is None:
+                return
+            plot_idx = int(new_idx)
+            item["plot_idx"] = plot_idx
+
+        data = self.get_plot_series_data(int(plot_idx))
+        if data is None:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Не удалось получить данные выбранного графика.")
+            return
+        x_data, y_data = data
+
+        try:
+            switches, y_min, y_max, mid = detect_mode_switches(x_data, y_data)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", f"Не удалось выполнить анализ режима:\n{e}")
+            return
+
+        # классификация переключений: начало/окончание режима
+        start_times: list[float] = []
+        end_times: list[float] = []
+        for sw in switches:
+            if sw.from_level < sw.to_level:
+                start_times.append(sw.t)
+            elif sw.from_level > sw.to_level:
+                end_times.append(sw.t)
+
+        # Сохраняем времена режимов и отображаем маркеры.
+        self._mode_start_times = list(start_times)
+        self._mode_end_times = list(end_times)
+        if hasattr(self, "right") and hasattr(self.right, "add_mode_markers"):
+            try:
+                self.right.add_mode_markers(start_times, end_times)
+            except Exception:
+                pass
+
+    def _on_mode_times_changed(self, start_times: list, end_times: list):
+        """Вызывается при перетаскивании режимных линий пользователем."""
+        self._mode_start_times = [float(t) for t in start_times]
+        self._mode_end_times = [float(t) for t in end_times]
+        self._project_dirty = True
 
     # --- Settings ---
     def _load_user_settings(self):
@@ -1663,12 +1890,13 @@ class VibrometryDialog(QtWidgets.QDialog):
 
 
 class CalculationDialog(QtWidgets.QDialog):
-    def __init__(self, title: str, plots: list[tuple[int, str]], parent=None):
+    def __init__(self, title: str, items: list[dict], parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(420, 380)
 
-        self._plots = plots
+        # items: список словарей с полями как минимум "label" и "plot_idx".
+        self._items = items
         self._worker_thread = None
         self._worker = None
 
@@ -1707,9 +1935,10 @@ class CalculationDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self._page_graph)
         lay.addWidget(QtWidgets.QLabel("Шаг 1. Выбор графика"))
         self._graph_combo = QtWidgets.QComboBox()
-        if self._plots:
-            for idx, label in self._plots:
-                self._graph_combo.addItem(label, idx)
+        if self._items:
+            for item in self._items:
+                label = item.get("label", "")
+                self._graph_combo.addItem(label, item)
         else:
             self._graph_combo.addItem("Нет активных графиков")
             self._graph_combo.setEnabled(False)
@@ -1767,7 +1996,7 @@ class CalculationDialog(QtWidgets.QDialog):
         idx = self._stack.currentIndex()
         self._btn_back.setEnabled(idx > 0)
         self._btn_next.setEnabled(idx < self._stack.count() - 1)
-        if not self._plots:
+        if not self._items:
             self._btn_next.setEnabled(False)
 
     def _next_step(self):

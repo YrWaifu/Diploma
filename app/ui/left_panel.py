@@ -4,16 +4,25 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 
 class Stick:
-    __slots__ = ("x", "y1", "y2", "color", "data_min", "data_max")
+    __slots__ = ("x", "y1", "y2", "color", "data_min", "data_max", "name")
 
-    def __init__(self, x: int, y1: int, y2: int, color: Optional[QtGui.QColor] = None,
-                 data_min: float = -1.0, data_max: float = 1.0):
+    def __init__(
+        self,
+        x: int,
+        y1: int,
+        y2: int,
+        color: Optional[QtGui.QColor] = None,
+        data_min: float = -1.0,
+        data_max: float = 1.0,
+        name: str = "",
+    ):
         self.x = int(x)
         self.y1 = int(min(y1, y2))
         self.y2 = int(max(y1, y2))
         self.color = color or QtGui.QColor(50, 90, 200)
         self.data_min = float(data_min)
         self.data_max = float(data_max)
+        self.name = str(name)
 
 
 class DotsCanvas(QtWidgets.QWidget):
@@ -202,6 +211,27 @@ class DotsCanvas(QtWidgets.QWidget):
             self._draw_handle(p, QtCore.QPoint(x, y1), s.color)
             self._draw_handle(p, QtCore.QPoint(x, y2), s.color)
             self._draw_scale(p, x, y1, y2, s.color, s.data_min, s.data_max)
+            # Подпись графика вдоль стика (вертикально, снизу вверх).
+            if s.name:
+                p.save()
+                try:
+                    scale_x0 = x - 12
+                    text_x = scale_x0 + 40
+                    text_y = int((y1 + y2) / 2)
+
+                    # Доступная длина текста = высота стика (текст повёрнут на –90°)
+                    avail = max(30, y2 - y1)
+                    fm = p.fontMetrics()
+                    elided = fm.elidedText(s.name, QtCore.Qt.ElideMiddle, avail)
+
+                    p.translate(text_x, text_y)
+                    p.rotate(-90)
+                    half = avail // 2
+                    rect = QtCore.QRect(-half, -20, avail, 40)
+                    p.setPen(QtGui.QPen(s.color))
+                    p.drawText(rect, QtCore.Qt.AlignCenter, elided)
+                finally:
+                    p.restore()
 
     def paintEvent(self, _):
         p = QtGui.QPainter(self)

@@ -36,6 +36,7 @@ def save_project(state: dict[str, Any], path: Path) -> None:
         "sources": state.get("sources", []),
         "plots": state.get("plots", []),
         "view": state.get("view", {}),
+        "mode_markers": state.get("mode_markers", {}),
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
@@ -60,6 +61,7 @@ def load_project(path: Path) -> dict[str, Any]:
         "sources": data.get("sources", []),
         "plots": data.get("plots", []),
         "view": data.get("view", {}),
+        "mode_markers": data.get("mode_markers", {}),
     }
 
 

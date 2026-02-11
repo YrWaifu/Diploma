@@ -11,6 +11,11 @@ from app.processing.vibrometry import (
     VibrometryTimeResult,
     estimate_fs_from_time,
 )
+from app.processing.modes import (
+    ModeSwitch,
+    detect_mode_levels,
+    detect_mode_switches,
+)
 
 __all__ = [
     "compute_strain_characteristics",
@@ -20,4 +25,7 @@ __all__ = [
     "VibrometryResult",
     "VibrometryTimeResult",
     "estimate_fs_from_time",
+    "ModeSwitch",
+    "detect_mode_levels",
+    "detect_mode_switches",
 ]
