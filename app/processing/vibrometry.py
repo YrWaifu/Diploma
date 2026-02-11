@@ -159,6 +159,164 @@ def compute_vibrometry(
     )
 
 
+# ---------------------------------------------------------------------------
+# Расширенный анализ: С.Ш.В. (полосовой) + Синусоидальная вибрация
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BandResult:
+    """Результат расчёта в одной полосе частот."""
+    f1: float
+    f2: float
+    rms: float    # СКЗ в полосе = √(∫ Sxx df)
+    sxx: float    # Суммарная спектральная мощность = ∫ Sxx df
+
+
+@dataclass
+class SinusoidalResult:
+    """Результат расчёта синусоидальной вибрации на одной базовой частоте."""
+    f0: float
+    equiv_amplitude: Optional[float] = None  # Эквивалентная амплитуда
+    eff_amplitude: Optional[float] = None    # Эффективная амплитуда
+
+
+@dataclass
+class FullVibrometryResult:
+    """Полный результат виброанализа: С.Ш.В. + синусоидальная."""
+    fs_hz: float
+    bands: list  # list[BandResult]
+    sinusoidal: list  # list[SinusoidalResult]
+
+
+def compute_bands(
+    x: np.ndarray,
+    fs_hz: float,
+    bands: list[tuple[float, float]],
+    segment_length: Optional[int] = None,
+) -> list[BandResult]:
+    """
+    Для каждой полосы [f1, f2] считает СКЗ и Sxx (суммарная спектральная мощность).
+    СКЗ = √(Sxx), Sxx = ∫_{f1}^{f2} P_xx(f) df.
+    """
+    x = np.asarray(x, dtype=float)
+    n = x.size
+    if n < 4 or fs_hz <= 0 or not bands:
+        return [BandResult(f1=f1, f2=f2, rms=np.nan, sxx=np.nan) for f1, f2 in bands]
+
+    L = segment_length if segment_length and segment_length >= 4 else min(256, n // 4)
+    L = min(L, n)
+    freqs, P_xx = psd_welch(x, fs_hz, segment_length=L)
+    if freqs.size == 0:
+        return [BandResult(f1=f1, f2=f2, rms=np.nan, sxx=np.nan) for f1, f2 in bands]
+
+    df = fs_hz / L
+    results = []
+    for f1, f2 in bands:
+        if f2 <= f1:
+            results.append(BandResult(f1=f1, f2=f2, rms=np.nan, sxx=np.nan))
+            continue
+        mask = (freqs >= f1) & (freqs <= f2)
+        if not np.any(mask):
+            results.append(BandResult(f1=f1, f2=f2, rms=0.0, sxx=0.0))
+            continue
+        sxx_val = float(np.sum(P_xx[mask]) * df)
+        rms_val = float(np.sqrt(max(0.0, sxx_val)))
+        results.append(BandResult(f1=f1, f2=f2, rms=rms_val, sxx=sxx_val))
+    return results
+
+
+def compute_sinusoidal(
+    x: np.ndarray,
+    fs_hz: float,
+    base_freqs: list[float],
+    delta_f: float = 0.375,
+    af_pct: float = 5.0,
+    ae_pct: float = 5.0,
+    al_pct: float = 50.0,
+    calc_equiv: bool = True,
+    calc_eff: bool = False,
+    segment_length: Optional[int] = None,
+) -> list[SinusoidalResult]:
+    """
+    Анализ синусоидальной вибрации на базовых частотах.
+
+    Для каждой базовой частоты f0:
+    - Определяем полосу поиска: [f0*(1 - Af/100), f0*(1 + Af/100)]
+    - Эквивалентная амплитуда: A_eq = √(2 * Σ Sxx[k] * Δf) для k, где Sxx[k] > (1 - Ae/100)*Sxx_peak
+    - Эффективная амплитуда:   A_eff = √(2 * Sxx_peak * Δf_res) — амплитуда пика PSD,
+      с учётом порога Al%.
+    """
+    x = np.asarray(x, dtype=float)
+    n = x.size
+    if n < 4 or fs_hz <= 0 or not base_freqs:
+        return [SinusoidalResult(f0=f) for f in base_freqs]
+
+    L = segment_length if segment_length and segment_length >= 4 else min(256, n // 4)
+    L = min(L, n)
+    freqs, P_xx = psd_welch(x, fs_hz, segment_length=L)
+    if freqs.size == 0:
+        return [SinusoidalResult(f0=f) for f in base_freqs]
+
+    df = fs_hz / L  # частотное разрешение
+
+    results = []
+    for f0 in base_freqs:
+        f_lo = f0 * (1.0 - af_pct / 100.0)
+        f_hi = f0 * (1.0 + af_pct / 100.0)
+        mask = (freqs >= f_lo) & (freqs <= f_hi)
+        if not np.any(mask):
+            results.append(SinusoidalResult(f0=f0))
+            continue
+
+        psd_band = P_xx[mask]
+        psd_peak = float(np.max(psd_band))
+
+        eq_amp = None
+        eff_amp = None
+
+        if calc_equiv and psd_peak > 0:
+            # Эквивалентная: суммируем бины выше порога (1 - Ae/100) * peak
+            threshold = psd_peak * (1.0 - ae_pct / 100.0)
+            sig_mask = psd_band >= threshold
+            eq_power = float(np.sum(psd_band[sig_mask]) * df)
+            eq_amp = float(np.sqrt(2.0 * max(0.0, eq_power)))
+
+        if calc_eff and psd_peak > 0:
+            # Эффективная: амплитуда пикового бина PSD с учётом допуска Al%
+            eff_power = float(psd_peak * df)
+            eff_amp = float(np.sqrt(2.0 * max(0.0, eff_power)))
+
+        results.append(SinusoidalResult(f0=f0, equiv_amplitude=eq_amp, eff_amplitude=eff_amp))
+    return results
+
+
+def compute_full_vibrometry(
+    x: np.ndarray,
+    fs_hz: float,
+    bands: list[tuple[float, float]] | None = None,
+    base_freqs: list[float] | None = None,
+    delta_f: float = 0.375,
+    af_pct: float = 5.0,
+    ae_pct: float = 5.0,
+    al_pct: float = 50.0,
+    calc_equiv: bool = True,
+    calc_eff: bool = False,
+    segment_length: Optional[int] = None,
+) -> FullVibrometryResult:
+    """Полный расчёт: С.Ш.В. по полосам + синусоидальная на базовых частотах."""
+    x = np.asarray(x, dtype=float)
+    n = x.size
+    fs = float(fs_hz)
+
+    band_results = compute_bands(x, fs, bands or [], segment_length) if bands else []
+    sin_results = (
+        compute_sinusoidal(x, fs, base_freqs, delta_f, af_pct, ae_pct, al_pct,
+                           calc_equiv, calc_eff, segment_length)
+        if base_freqs else []
+    )
+    return FullVibrometryResult(fs_hz=fs, bands=band_results, sinusoidal=sin_results)
+
+
 def estimate_fs_from_time(t: np.ndarray) -> float:
     """Оценка частоты дискретизации по равномерной сетке времени: fs = 1/Δt."""
     t = np.asarray(t, dtype=float)

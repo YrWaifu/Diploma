@@ -7,8 +7,12 @@ from app.processing.strain import compute_strain_characteristics, StrainResult
 from app.processing.vibrometry import (
     compute_vibrometry,
     compute_time_characteristics,
+    compute_full_vibrometry,
     VibrometryResult,
     VibrometryTimeResult,
+    FullVibrometryResult,
+    BandResult,
+    SinusoidalResult,
     estimate_fs_from_time,
 )
 from app.processing.modes import (

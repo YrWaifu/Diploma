@@ -17,7 +17,11 @@ from app.processing import (
     compute_strain_characteristics,
     StrainResult,
     compute_vibrometry,
+    compute_full_vibrometry,
     VibrometryResult,
+    FullVibrometryResult,
+    BandResult,
+    SinusoidalResult,
     estimate_fs_from_time,
     detect_mode_switches,
 )
@@ -287,15 +291,48 @@ class MainWindow(QtWidgets.QMainWindow):
         maximum: int = 0,
         min_duration_ms: int = 0,
     ) -> QtWidgets.QProgressDialog:
-        """Создаёт прогресс-диалог в едином стиле приложения. Показывается сразу при min_duration_ms=0."""
+        """Создаёт прогресс-диалог в едином стиле приложения.
+
+        ВАЖНО: после нажатия «Отмена» диалог игнорирует все входящие
+        setValue / setLabelText / setRange, чтобы рабочий поток не мог
+        «воскресить» уже отменённый диалог (известная особенность Qt).
+        """
         dlg = QtWidgets.QProgressDialog(label_text, "Отмена", 0, maximum, self)
         dlg._base_title = title  # type: ignore[attr-defined]
+        dlg._user_canceled = False  # type: ignore[attr-defined]
         dlg.setWindowTitle(title)
         dlg.setWindowModality(QtCore.Qt.ApplicationModal)
         dlg.setMinimumDuration(min_duration_ms)
         dlg.setStyleSheet(self._PROGRESS_STYLE)
         dlg.setAutoClose(False)
         dlg.setAutoReset(False)
+
+        # --- Перехватываем отмену, чтобы заблокировать входящие обновления ---
+        _orig_setValue = dlg.setValue
+        _orig_setLabelText = dlg.setLabelText
+        _orig_setRange = dlg.setRange
+
+        def _on_user_cancel():
+            dlg._user_canceled = True  # type: ignore[attr-defined]
+            dlg.hide()
+
+        def _safe_setValue(val):
+            if not dlg._user_canceled:  # type: ignore[attr-defined]
+                _orig_setValue(val)
+
+        def _safe_setLabelText(txt):
+            if not dlg._user_canceled:  # type: ignore[attr-defined]
+                _orig_setLabelText(txt)
+
+        def _safe_setRange(lo, hi):
+            if not dlg._user_canceled:  # type: ignore[attr-defined]
+                _orig_setRange(lo, hi)
+
+        dlg.canceled.connect(_on_user_cancel)
+        dlg.setValue = _safe_setValue  # type: ignore[assignment]
+        dlg.setLabelText = _safe_setLabelText  # type: ignore[assignment]
+        dlg.setRange = _safe_setRange  # type: ignore[assignment]
+
         # Добавляем простой счётчик прошедшего времени в заголовок.
         dlg._start_time = time.monotonic()  # type: ignore[attr-defined]
         timer = QtCore.QTimer(dlg)
@@ -303,6 +340,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def _update_title():
             try:
+                if dlg._user_canceled:  # type: ignore[attr-defined]
+                    timer.stop()
+                    return
                 start = getattr(dlg, "_start_time", None)
                 base = getattr(dlg, "_base_title", title)
                 if start is None:
@@ -646,12 +686,17 @@ class MainWindow(QtWidgets.QMainWindow):
             event_loop.quit()
             progress_dlg.close()
 
+        def on_cancel():
+            worker.request_cancel()
+            progress_dlg.close()
+            event_loop.quit()
+
         worker.progress_value.connect(progress_dlg.setValue)
         worker.progress_label.connect(progress_dlg.setLabelText)
         worker.progress_range.connect(lambda m: progress_dlg.setRange(0, max(1, m)))
         worker.one_series_loaded.connect(on_one_series)
         worker.finished_signal.connect(on_finished)
-        progress_dlg.canceled.connect(worker.request_cancel)
+        progress_dlg.canceled.connect(on_cancel)
 
         thread.started.connect(worker.run)
         thread.finished.connect(thread.deleteLater)
@@ -1009,18 +1054,27 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
 
+        _was_canceled = [False]
+
         def on_finished(x_data, y_data, err):
             progress_dlg.close()
             thread.quit()
             thread.wait()
             worker.deleteLater()
             thread.deleteLater()
+            if _was_canceled[0]:
+                return  # пользователь отменил — игнорируем результат
             if err is not None or x_data is None or y_data is None:
                 QtWidgets.QMessageBox.warning(self, "Ошибка", f"Не удалось загрузить ряд\n{file_path}\n\n{err}")
                 return
             self._finalize_added_series(desc, x_data, y_data)
 
-        progress_dlg.canceled.connect(worker.cancel)
+        def on_cancel():
+            _was_canceled[0] = True
+            worker.cancel()
+            progress_dlg.close()
+
+        progress_dlg.canceled.connect(on_cancel)
         worker.setRange.connect(lambda mx, text: (progress_dlg.setRange(0, mx), progress_dlg.setLabelText(text)))
         worker.setValue.connect(lambda val, text: (progress_dlg.setValue(val), progress_dlg.setLabelText(text)))
         worker.finished.connect(on_finished)
@@ -1192,17 +1246,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):
         if self._project_dirty:
-            reply = QtWidgets.QMessageBox.question(
-                self,
-                "Подтверждение",
-                "Проект изменён. Сохранить изменения перед закрытием?",
-                QtWidgets.QMessageBox.Save | QtWidgets.QMessageBox.Discard | QtWidgets.QMessageBox.Cancel,
-                QtWidgets.QMessageBox.Save,
-            )
-            if reply == QtWidgets.QMessageBox.Cancel:
+            msg = QtWidgets.QMessageBox(self)
+            msg.setWindowTitle("Подтверждение")
+            msg.setText("Проект изменён. Сохранить изменения перед закрытием?")
+            btn_save = msg.addButton("Сохранить", QtWidgets.QMessageBox.AcceptRole)
+            btn_discard = msg.addButton("Не сохранять", QtWidgets.QMessageBox.DestructiveRole)
+            btn_cancel = msg.addButton("Отмена", QtWidgets.QMessageBox.RejectRole)
+            msg.setDefaultButton(btn_save)
+            msg.exec_()
+            clicked = msg.clickedButton()
+            if clicked == btn_cancel:
                 event.ignore()
                 return
-            if reply == QtWidgets.QMessageBox.Save:
+            if clicked == btn_save:
                 if not self._save_project():
                     event.ignore()
                     return
@@ -1290,7 +1346,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 break
 
     def _preload_provider_series(self, file_path: Path, provider, series_list: list, progress: QtWidgets.QProgressDialog | None = None, current_step: int = 0) -> bool:
-        # ??????? ????????? ????????: ??????? ?????????? ?????? ?????, ????? ????????? ??????
         local_progress = progress
         if local_progress is None:
             local_progress = self._create_progress_dialog(
@@ -1298,12 +1353,11 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             local_progress.setValue(0)
 
-        # ?????? ?????????? ????? (????? ?????? ?????) ? ?????????? ?????? ?????
-        # Переносим всю тяжёлую работу в фоновый поток — GUI не зависает
         worker = _PreloadWorker(provider, file_path, series_list)
         thread = QtCore.QThread(self)
         worker.moveToThread(thread)
         event_loop = QtCore.QEventLoop()
+        _canceled_flag = [False]
 
         def on_finished(_canceled: bool):
             thread.quit()
@@ -1311,19 +1365,27 @@ class MainWindow(QtWidgets.QMainWindow):
             if progress is None:
                 local_progress.close()
 
+        def on_cancel():
+            _canceled_flag[0] = True
+            worker.request_cancel()
+            # Немедленно закрываем диалог и прерываем ожидание — не ждём, пока поток дочитает.
+            if progress is None:
+                local_progress.close()
+            event_loop.quit()
+
         worker.progress_value.connect(local_progress.setValue)
         worker.progress_label.connect(local_progress.setLabelText)
         worker.progress_range.connect(lambda m: local_progress.setRange(0, max(1, m)))
         worker.finished_signal.connect(on_finished)
         if progress is None:
-            local_progress.canceled.connect(worker.request_cancel)
+            local_progress.canceled.connect(on_cancel)
 
         thread.started.connect(worker.run)
         thread.finished.connect(thread.deleteLater)
         thread.start()
         event_loop.exec_()
 
-        return worker._canceled
+        return _canceled_flag[0] or worker._canceled
 
     def _rollback_new_imports(self, file_paths: List[Path]):
         # ??????? datasets ? ?????????? ??????????? ? ???? ???????
@@ -1559,18 +1621,27 @@ class TensometryBatchWorker(QtCore.QObject):
 
 
 class VibrometryBatchWorker(QtCore.QObject):
-    """Воркер: для каждой пары (график, режимный интервал) считает VibrometryResult."""
+    """Воркер: для каждой пары (график, режимный интервал) считает FullVibrometryResult."""
     progress = QtCore.pyqtSignal(int)
-    one_result = QtCore.pyqtSignal(str, str, object)  # graph_label, mode_label, VibrometryResult
+    one_result = QtCore.pyqtSignal(str, str, object)  # graph_label, mode_label, FullVibrometryResult
     finished = QtCore.pyqtSignal()
 
-    def __init__(self, items: list, band_f1_hz: float | None = None,
-                 band_f2_hz: float | None = None, segment_length: int | None = None):
+    def __init__(self, items: list, bands: list[tuple[float, float]] | None = None,
+                 base_freqs: list[float] | None = None,
+                 delta_f: float = 0.375, af_pct: float = 5.0,
+                 ae_pct: float = 5.0, al_pct: float = 50.0,
+                 calc_equiv: bool = True, calc_eff: bool = False,
+                 segment_length: int | None = None):
         super().__init__()
-        # items: [(graph_label, mode_label, x_slice, y_slice), ...]
         self._items = list(items)
-        self._band_f1 = float(band_f1_hz) if band_f1_hz is not None else None
-        self._band_f2 = float(band_f2_hz) if band_f2_hz is not None else None
+        self._bands = bands or []
+        self._base_freqs = base_freqs or []
+        self._delta_f = delta_f
+        self._af_pct = af_pct
+        self._ae_pct = ae_pct
+        self._al_pct = al_pct
+        self._calc_equiv = calc_equiv
+        self._calc_eff = calc_eff
         self._segment_length = int(segment_length) if segment_length and segment_length >= 4 else None
 
     @QtCore.pyqtSlot()
@@ -1582,8 +1653,15 @@ class VibrometryBatchWorker(QtCore.QObject):
             fs = estimate_fs_from_time(x)
             if not np.isfinite(fs) or fs <= 0:
                 fs = 1000.0
-            r = compute_vibrometry(y, fs_hz=fs, band_f1_hz=self._band_f1,
-                                   band_f2_hz=self._band_f2, segment_length=self._segment_length)
+            r = compute_full_vibrometry(
+                y, fs_hz=fs,
+                bands=self._bands if self._bands else None,
+                base_freqs=self._base_freqs if self._base_freqs else None,
+                delta_f=self._delta_f, af_pct=self._af_pct,
+                ae_pct=self._ae_pct, al_pct=self._al_pct,
+                calc_equiv=self._calc_equiv, calc_eff=self._calc_eff,
+                segment_length=self._segment_length,
+            )
             self.one_result.emit(graph_label, mode_label, r)
             self.progress.emit(int((i + 1) * 100 / n) if n else 100)
         self.finished.emit()
@@ -1853,55 +1931,301 @@ class TensometryDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Ошибка сохранения", str(e))
 
 
+class _FreqBandTable(QtWidgets.QWidget):
+    """Таблица полос частот (f1…f2) с прокруткой и кнопками «Добавить» / «Удалить»."""
+
+    def __init__(self, header_left: str = "f₁", header_right: str = "f₂", parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self._table = QtWidgets.QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels([header_left, header_right])
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalHeader().setVisible(True)
+        self._table.setMinimumHeight(90)
+        lay.addWidget(self._table)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_add = QtWidgets.QPushButton("Добавить")
+        btn_del = QtWidgets.QPushButton("Удалить")
+        btn_add.clicked.connect(self._add_row)
+        btn_del.clicked.connect(self._del_row)
+        btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_del)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+
+    def _add_row(self):
+        r = self._table.rowCount()
+        self._table.insertRow(r)
+
+    def _del_row(self):
+        r = self._table.currentRow()
+        if r >= 0:
+            self._table.removeRow(r)
+
+    def get_values(self) -> list[tuple[float, float]]:
+        result = []
+        for r in range(self._table.rowCount()):
+            it1 = self._table.item(r, 0)
+            it2 = self._table.item(r, 1)
+            if it1 and it2:
+                try:
+                    result.append((float(it1.text().replace(",", ".")),
+                                   float(it2.text().replace(",", "."))))
+                except ValueError:
+                    pass
+        return result
+
+    def row_count(self) -> int:
+        return self._table.rowCount()
+
+    def has_empty(self) -> bool:
+        for r in range(self._table.rowCount()):
+            for c in range(2):
+                it = self._table.item(r, c)
+                if not it or not it.text().strip():
+                    return True
+        return False
+
+
+class _SingleFreqTable(QtWidgets.QWidget):
+    """Таблица одиночных значений частот с прокруткой и кнопками «Добавить» / «Удалить»."""
+
+    def __init__(self, header: str = "Частота, Гц", parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self._table = QtWidgets.QTableWidget(0, 1)
+        self._table.setHorizontalHeaderLabels([header])
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalHeader().setVisible(True)
+        self._table.setMinimumHeight(90)
+        lay.addWidget(self._table)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_add = QtWidgets.QPushButton("Добавить")
+        btn_del = QtWidgets.QPushButton("Удалить")
+        btn_add.clicked.connect(self._add_row)
+        btn_del.clicked.connect(self._del_row)
+        btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_del)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+
+    def _add_row(self):
+        r = self._table.rowCount()
+        self._table.insertRow(r)
+
+    def _del_row(self):
+        r = self._table.currentRow()
+        if r >= 0:
+            self._table.removeRow(r)
+
+    def get_values(self) -> list[float]:
+        result = []
+        for r in range(self._table.rowCount()):
+            it = self._table.item(r, 0)
+            if it:
+                try:
+                    result.append(float(it.text().replace(",", ".")))
+                except ValueError:
+                    pass
+        return result
+
+    def row_count(self) -> int:
+        return self._table.rowCount()
+
+    def has_empty(self) -> bool:
+        for r in range(self._table.rowCount()):
+            it = self._table.item(r, 0)
+            if not it or not it.text().strip():
+                return True
+        return False
+
+
 class VibrometryDialog(QtWidgets.QDialog):
-    """Виброметрирование: выбор графиков + режимов, полоса частот, расчёт → экспорт в xlsx."""
+    """Виброметрирование: С.Ш.В. + синусоидальная вибрация, выбор графиков/режимов → xlsx."""
 
     def __init__(self, plots: list[tuple[int, str]],
                  modes: list[tuple[str, float, float]], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Виброметрирование (вибрации)")
-        self.resize(540, 520)
+        self.resize(820, 700)
         self._plots = plots
         self._modes = modes
-        self._results: list[tuple[str, str, VibrometryResult]] = []
+        self._results: list[tuple[str, str, FullVibrometryResult]] = []
         self._worker_thread = None
         self._worker = None
 
-        layout = QtWidgets.QVBoxLayout(self)
+        root = QtWidgets.QVBoxLayout(self)
 
         # --- Вкладки: Графики / Режимы ---
         self._tabs, self._graph_list, self._mode_list = _build_selection_tabs(plots, modes)
-        layout.addWidget(self._tabs)
+        self._tabs.setMaximumHeight(200)
+        root.addWidget(self._tabs)
 
-        # --- Параметры ---
-        grp_params = QtWidgets.QGroupBox("Параметры")
-        params_lay = QtWidgets.QFormLayout(grp_params)
-        self._f1_spin = QtWidgets.QDoubleSpinBox()
-        self._f1_spin.setRange(0.0, 1e6); self._f1_spin.setValue(0.0)
-        self._f1_spin.setDecimals(2); self._f1_spin.setSuffix(" Гц")
-        self._f2_spin = QtWidgets.QDoubleSpinBox()
-        self._f2_spin.setRange(0.0, 1e6); self._f2_spin.setValue(1000.0)
-        self._f2_spin.setDecimals(2); self._f2_spin.setSuffix(" Гц")
-        self._use_band_cb = QtWidgets.QCheckBox("СКЗ в полосе частот (по PSD Уэлча)")
-        self._use_band_cb.setChecked(True)
-        params_lay.addRow("Полоса частот f₁:", self._f1_spin)
-        params_lay.addRow("Полоса частот f₂:", self._f2_spin)
-        params_lay.addRow("", self._use_band_cb)
-        layout.addWidget(grp_params)
+        # ============= Параметры: С.Ш.В. (лево) + Синусоидальная (право) =============
+        params_row = QtWidgets.QHBoxLayout()
 
-        # --- Рассчитать ---
+        # ---------- Левый блок: С.Ш.В. ----------
+        self._shv_cb = QtWidgets.QCheckBox("С. Ш. В.")
+        self._shv_cb.setStyleSheet("font-weight: bold; font-size: 13px;")
+        self._shv_cb.toggled.connect(self._on_shv_toggled)
+
+        self._shv_frame = QtWidgets.QFrame()
+        self._shv_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        shv_lay = QtWidgets.QVBoxLayout(self._shv_frame)
+        shv_lay.setContentsMargins(6, 4, 6, 4)
+
+        # Подвыбор: СКЗ / Sxx
+        cb_row = QtWidgets.QHBoxLayout()
+        self._skz_cb = QtWidgets.QCheckBox("СКЗ")
+        self._sxx_cb = QtWidgets.QCheckBox("Sxx")
+        self._skz_cb.setChecked(True)
+        cb_row.addWidget(self._skz_cb)
+        cb_row.addWidget(self._sxx_cb)
+        cb_row.addStretch(1)
+        shv_lay.addLayout(cb_row)
+
+        # Таблица диапазонов частот
+        shv_lay.addWidget(QtWidgets.QLabel("Диапазоны частот:"))
+        self._bands_table = _FreqBandTable("f₁, Гц", "f₂, Гц")
+        shv_lay.addWidget(self._bands_table)
+
+        left_box = QtWidgets.QVBoxLayout()
+        left_box.addWidget(self._shv_cb)
+        left_box.addWidget(self._shv_frame)
+        params_row.addLayout(left_box, 1)
+
+        # ---------- Правый блок: Синусоидальная вибрация ----------
+        self._sin_cb = QtWidgets.QCheckBox("Синусоидальная вибрация")
+        self._sin_cb.setStyleSheet("font-weight: bold; font-size: 13px;")
+        self._sin_cb.toggled.connect(self._on_sin_toggled)
+
+        self._sin_frame = QtWidgets.QFrame()
+        self._sin_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        sin_lay = QtWidgets.QVBoxLayout(self._sin_frame)
+        sin_lay.setContentsMargins(6, 4, 6, 4)
+
+        form = QtWidgets.QFormLayout()
+        self._delta_f_spin = QtWidgets.QDoubleSpinBox()
+        self._delta_f_spin.setRange(0.001, 1000.0)
+        self._delta_f_spin.setValue(0.375)
+        self._delta_f_spin.setDecimals(3)
+        self._delta_f_spin.setSuffix("")
+        form.addRow("Приращение частоты [Δf]:", self._delta_f_spin)
+
+        self._af_spin = QtWidgets.QDoubleSpinBox()
+        self._af_spin.setRange(0.01, 100.0)
+        self._af_spin.setValue(5.0)
+        self._af_spin.setDecimals(2)
+        form.addRow("Допуск по частоте Af [%]:", self._af_spin)
+        sin_lay.addLayout(form)
+
+        # Эквивалентные амплитуды
+        self._equiv_cb = QtWidgets.QCheckBox("Эквивалентные амплитуды")
+        sin_lay.addWidget(self._equiv_cb)
+        ae_row = QtWidgets.QHBoxLayout()
+        ae_row.addWidget(QtWidgets.QLabel("Допуск по энергии Ae [%]:"))
+        self._ae_spin = QtWidgets.QDoubleSpinBox()
+        self._ae_spin.setRange(0.01, 100.0)
+        self._ae_spin.setValue(5.0)
+        self._ae_spin.setDecimals(2)
+        ae_row.addWidget(self._ae_spin)
+        ae_row.addStretch(1)
+        sin_lay.addLayout(ae_row)
+
+        # Эффективная амплитуда
+        self._eff_cb = QtWidgets.QCheckBox("Эффективная амплитуда")
+        sin_lay.addWidget(self._eff_cb)
+        al_row = QtWidgets.QHBoxLayout()
+        al_row.addWidget(QtWidgets.QLabel("Допуск по уровню Al [%]:"))
+        self._al_spin = QtWidgets.QDoubleSpinBox()
+        self._al_spin.setRange(0.01, 100.0)
+        self._al_spin.setValue(50.0)
+        self._al_spin.setDecimals(2)
+        al_row.addWidget(self._al_spin)
+        al_row.addStretch(1)
+        sin_lay.addLayout(al_row)
+
+        # Базовые частоты
+        sin_lay.addWidget(QtWidgets.QLabel("Базовые частоты:"))
+        self._base_freq_table = _SingleFreqTable("Частота, Гц")
+        sin_lay.addWidget(self._base_freq_table)
+
+        right_box = QtWidgets.QVBoxLayout()
+        right_box.addWidget(self._sin_cb)
+        right_box.addWidget(self._sin_frame)
+        params_row.addLayout(right_box, 1)
+
+        root.addLayout(params_row)
+
+        # Начальное состояние: оба блока заблокированы
+        self._shv_frame.setEnabled(False)
+        self._sin_frame.setEnabled(False)
+
+        # --- Расчёт ---
         self._progress = QtWidgets.QProgressBar()
-        self._progress.setRange(0, 100); self._progress.setValue(0); self._progress.setVisible(False)
-        self._calc_btn = QtWidgets.QPushButton("Рассчитать и сохранить в xlsx")
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setVisible(False)
+        self._calc_btn = QtWidgets.QPushButton("Расчёт")
         self._calc_btn.clicked.connect(self._run_calculation)
-        layout.addWidget(self._progress)
-        layout.addWidget(self._calc_btn)
+        root.addWidget(self._progress)
+        root.addWidget(self._calc_btn)
 
         btn_close = QtWidgets.QPushButton("Закрыть")
         btn_close.clicked.connect(self.accept)
-        layout.addWidget(btn_close)
+        root.addWidget(btn_close)
 
-    # --- расчёт ---
+    # ---------- toggle helpers ----------
+    def _on_shv_toggled(self, checked: bool):
+        self._shv_frame.setEnabled(checked)
+
+    def _on_sin_toggled(self, checked: bool):
+        self._sin_frame.setEnabled(checked)
+
+    # ---------- validation ----------
+    def _validate(self) -> bool:
+        if not self._shv_cb.isChecked() and not self._sin_cb.isChecked():
+            QtWidgets.QMessageBox.warning(self, "Ошибка",
+                                          "Выберите хотя бы один вид анализа (С.Ш.В. или Синусоидальная).")
+            return False
+
+        if self._shv_cb.isChecked():
+            if not self._skz_cb.isChecked() and not self._sxx_cb.isChecked():
+                QtWidgets.QMessageBox.warning(self, "Ошибка",
+                                              "С.Ш.В.: выберите хотя бы один параметр (СКЗ или Sxx).")
+                return False
+            if self._bands_table.row_count() == 0:
+                QtWidgets.QMessageBox.warning(self, "Ошибка",
+                                              "С.Ш.В.: добавьте хотя бы один диапазон частот.")
+                return False
+            if self._bands_table.has_empty():
+                QtWidgets.QMessageBox.warning(self, "Ошибка",
+                                              "С.Ш.В.: заполните все ячейки в таблице диапазонов.")
+                return False
+
+        if self._sin_cb.isChecked():
+            if not self._equiv_cb.isChecked() and not self._eff_cb.isChecked():
+                QtWidgets.QMessageBox.warning(self, "Ошибка",
+                                              "Синусоидальная: выберите хотя бы один пункт "
+                                              "(Экв. амплитуды или Эфф. амплитуда).")
+                return False
+            if self._base_freq_table.row_count() == 0:
+                QtWidgets.QMessageBox.warning(self, "Ошибка",
+                                              "Синусоидальная: добавьте хотя бы одну базовую частоту.")
+                return False
+            if self._base_freq_table.has_empty():
+                QtWidgets.QMessageBox.warning(self, "Ошибка",
+                                              "Синусоидальная: заполните все ячейки базовых частот.")
+                return False
+        return True
+
+    # ---------- расчёт ----------
     def _run_calculation(self):
         main_win = self.parent()
         if not main_win or not hasattr(main_win, "get_plot_series_data"):
@@ -1916,14 +2240,31 @@ class VibrometryDialog(QtWidgets.QDialog):
         if not checked_modes:
             QtWidgets.QMessageBox.warning(self, "Ошибка", "Выберите хотя бы один режим.")
             return
-
-        band_f1 = self._f1_spin.value() if self._use_band_cb.isChecked() else None
-        band_f2 = self._f2_spin.value() if self._use_band_cb.isChecked() else None
-        if self._use_band_cb.isChecked() and band_f2 is not None and band_f1 is not None and band_f2 <= band_f1:
-            QtWidgets.QMessageBox.warning(self, "Ошибка", "Полоса частот: f₂ должна быть больше f₁.")
+        if not self._validate():
             return
 
-        items = []  # [(graph_label, mode_label, x_slice, y_slice), ...]
+        # Собираем параметры
+        bands = self._bands_table.get_values() if self._shv_cb.isChecked() else []
+        base_freqs = self._base_freq_table.get_values() if self._sin_cb.isChecked() else []
+        calc_equiv = self._equiv_cb.isChecked() if self._sin_cb.isChecked() else False
+        calc_eff = self._eff_cb.isChecked() if self._sin_cb.isChecked() else False
+        delta_f = self._delta_f_spin.value()
+        af_pct = self._af_spin.value()
+        ae_pct = self._ae_spin.value()
+        al_pct = self._al_spin.value()
+
+        # Запоминаем для xlsx
+        self._calc_shv = self._shv_cb.isChecked()
+        self._calc_skz = self._skz_cb.isChecked() if self._calc_shv else False
+        self._calc_sxx = self._sxx_cb.isChecked() if self._calc_shv else False
+        self._calc_sin = self._sin_cb.isChecked()
+        self._calc_equiv = calc_equiv
+        self._calc_eff = calc_eff
+        self._bands_list = bands
+        self._base_freqs_list = base_freqs
+
+        # Нарезаем данные по графикам × режимам
+        items = []
         self._short_names: Dict[str, str] = {}
         for g_idx, g_label in checked_graphs:
             src = main_win._plot_index_to_source.get(g_idx)
@@ -1951,13 +2292,16 @@ class VibrometryDialog(QtWidgets.QDialog):
         self._results.clear()
         self._checked_graphs_labels = [lbl for _, lbl in checked_graphs]
         self._checked_modes_labels = [self._modes[mi][0] for mi, _ in checked_modes]
-        self._band_f1 = band_f1
-        self._band_f2 = band_f2
-        self._progress.setVisible(True); self._progress.setValue(0)
+        self._progress.setVisible(True)
+        self._progress.setValue(0)
         self._calc_btn.setEnabled(False)
 
         self._worker_thread = QtCore.QThread(self)
-        self._worker = VibrometryBatchWorker(items, band_f1_hz=band_f1, band_f2_hz=band_f2)
+        self._worker = VibrometryBatchWorker(
+            items, bands=bands, base_freqs=base_freqs,
+            delta_f=delta_f, af_pct=af_pct, ae_pct=ae_pct, al_pct=al_pct,
+            calc_equiv=calc_equiv, calc_eff=calc_eff,
+        )
         self._worker.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._progress.setValue)
@@ -1967,77 +2311,234 @@ class VibrometryDialog(QtWidgets.QDialog):
         self._worker_thread.finished.connect(self._worker_thread.deleteLater)
         self._worker_thread.start()
 
-    def _collect_result(self, graph_label: str, mode_label: str, r: VibrometryResult):
+    def _collect_result(self, graph_label: str, mode_label: str, r: FullVibrometryResult):
         self._results.append((graph_label, mode_label, r))
 
     def _on_finished(self):
-        self._progress.setValue(100); self._progress.setVisible(False)
+        self._progress.setValue(100)
+        self._progress.setVisible(False)
         self._calc_btn.setEnabled(True)
         if not self._results:
             QtWidgets.QMessageBox.information(self, "Готово", "Нет результатов для сохранения.")
             return
         self._export_xlsx()
 
+    # ---------- xlsx ----------
     def _export_xlsx(self):
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment
+        from openpyxl.utils import get_column_letter as _gcl
 
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Сохранить результаты", "", "Excel (*.xlsx);;Все файлы (*.*)")
         if not path:
             return
 
-        PARAM_NAMES = ["Среднее (μ)", "СКЗ (x_rms)", "Пик (max|x₀|)",
-                       "Пик-пик", "Пик-фактор (CF)"]
-        has_band = self._band_f1 is not None and self._band_f2 is not None
-        if has_band:
-            PARAM_NAMES.append(f"СКЗ [{self._band_f1:.0f}–{self._band_f2:.0f}] Гц")
-
         wb = Workbook()
         ws = wb.active
         ws.title = "Виброметрирование"
         bold = Font(bold=True)
-        center = Alignment(horizontal='center')
+        center = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
-        data_map: Dict[str, Dict[str, VibrometryResult]] = {}
-        for g, m, r in self._results:
-            data_map.setdefault(g, {})[m] = r
+        # Собираем структуру столбцов по одному графику:
+        # --- С.Ш.В. ---
+        bands = self._bands_list
+        has_skz = self._calc_skz
+        has_sxx = self._calc_sxx
+        n_bands = len(bands)
+        n_shv_cols = 0
+        if self._calc_shv:
+            if has_skz:
+                n_shv_cols += n_bands
+            if has_sxx:
+                n_shv_cols += n_bands
+
+        # --- Синусоидальная ---
+        base_freqs = self._base_freqs_list
+        has_equiv = self._calc_equiv
+        has_eff = self._calc_eff
+        n_sin_per_freq = int(has_equiv) + int(has_eff)
+        n_sin_cols = len(base_freqs) * n_sin_per_freq if self._calc_sin else 0
+
+        n_cols_per_graph = n_shv_cols + n_sin_cols
+        if n_cols_per_graph == 0:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Нет столбцов для экспорта.")
+            return
 
         graphs = self._checked_graphs_labels
         modes = self._checked_modes_labels
 
-        c0 = ws.cell(1, 1, "Режим")
-        c0.font = bold; c0.alignment = center
-        col = 2
+        # Группируем результаты
+        data_map: Dict[str, Dict[str, FullVibrometryResult]] = {}
+        for g, m, r in self._results:
+            data_map.setdefault(g, {})[m] = r
+
+        # ---- Заголовки (4 строки) ----
+        # A1..A4: «№ реж.» (merge 4 rows)
+        ws.merge_cells(start_row=1, start_column=1, end_row=4, end_column=1)
+        c0 = ws.cell(1, 1, "№ реж.")
+        c0.font = bold
+        c0.alignment = center
+
+        col = 2  # начинаем со столбца 2
         for g in graphs:
             short = self._short_names.get(g, g)
-            ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + len(PARAM_NAMES) - 1)
-            cell = ws.cell(1, col, short)
-            cell.font = bold; cell.alignment = center
-            for pi, pname in enumerate(PARAM_NAMES):
-                ws.cell(2, col + pi, pname).font = bold
-            col += len(PARAM_NAMES)
+            g_start = col
+            g_end = col + n_cols_per_graph - 1
 
+            # Строка 1: имя графика
+            if g_end > g_start:
+                ws.merge_cells(start_row=1, start_column=g_start, end_row=1, end_column=g_end)
+            c = ws.cell(1, g_start, short)
+            c.font = bold
+            c.alignment = center
+
+            inner_col = g_start
+
+            # --- С.Ш.В. ---
+            if self._calc_shv and n_shv_cols > 0:
+                shv_start = inner_col
+                shv_end = inner_col + n_shv_cols - 1
+                # Строка 2: «С.Ш.В.»
+                if shv_end > shv_start:
+                    ws.merge_cells(start_row=2, start_column=shv_start, end_row=2, end_column=shv_end)
+                c = ws.cell(2, shv_start, "С.Ш.В.")
+                c.font = bold
+                c.alignment = center
+
+                # Строка 3: «СКЗ по полосам» / «Sxx по полосам»
+                if has_skz:
+                    skz_start = inner_col
+                    skz_end = inner_col + n_bands - 1
+                    if skz_end > skz_start:
+                        ws.merge_cells(start_row=3, start_column=skz_start, end_row=3, end_column=skz_end)
+                    c = ws.cell(3, skz_start, "СКЗ по полосам")
+                    c.font = bold
+                    c.alignment = center
+                    # Строка 4: диапазоны
+                    for bi, (f1, f2) in enumerate(bands):
+                        lbl = f"{f1:g}...{f2:g}"
+                        c = ws.cell(4, inner_col + bi, lbl)
+                        c.font = bold
+                        c.alignment = center
+                    inner_col += n_bands
+
+                if has_sxx:
+                    sxx_start = inner_col
+                    sxx_end = inner_col + n_bands - 1
+                    if sxx_end > sxx_start:
+                        ws.merge_cells(start_row=3, start_column=sxx_start, end_row=3, end_column=sxx_end)
+                    c = ws.cell(3, sxx_start, "Sxx по полосам")
+                    c.font = bold
+                    c.alignment = center
+                    for bi, (f1, f2) in enumerate(bands):
+                        lbl = f"{f1:g}...{f2:g}"
+                        c = ws.cell(4, inner_col + bi, lbl)
+                        c.font = bold
+                        c.alignment = center
+                    inner_col += n_bands
+
+            # --- Синусоидальная вибрация ---
+            if self._calc_sin and n_sin_cols > 0:
+                sin_start = inner_col
+                sin_end = inner_col + n_sin_cols - 1
+                # Строка 2: «Синусоидальная вибрация»
+                if sin_end > sin_start:
+                    ws.merge_cells(start_row=2, start_column=sin_start, end_row=2, end_column=sin_end)
+                c = ws.cell(2, sin_start, "Синусоидальная вибрация")
+                c.font = bold
+                c.alignment = center
+
+                # Строка 3: по каждой базовой частоте
+                for fi, f0 in enumerate(base_freqs):
+                    freq_start = inner_col
+                    freq_end = inner_col + n_sin_per_freq - 1
+                    freq_label = f"{f0:g} Гц"
+                    if freq_end > freq_start:
+                        ws.merge_cells(start_row=3, start_column=freq_start, end_row=3, end_column=freq_end)
+                    c = ws.cell(3, freq_start, freq_label)
+                    c.font = bold
+                    c.alignment = center
+
+                    # Строка 4: Экв. / Эфф.
+                    sub_col = inner_col
+                    if has_equiv:
+                        c = ws.cell(4, sub_col, "Экв.")
+                        c.font = bold
+                        c.alignment = center
+                        sub_col += 1
+                    if has_eff:
+                        c = ws.cell(4, sub_col, "Эфф.")
+                        c.font = bold
+                        c.alignment = center
+                        sub_col += 1
+                    inner_col += n_sin_per_freq
+
+            col += n_cols_per_graph
+
+        # ---- Данные ----
+        DATA_START_ROW = 5
         for ri, mode_label in enumerate(modes):
-            row = ri + 3
-            ws.cell(row, 1, mode_label).font = bold
+            row = DATA_START_ROW + ri
+            mc = ws.cell(row, 1, mode_label)
+            mc.font = bold
+            mc.alignment = center
             col = 2
             for g in graphs:
                 r = data_map.get(g, {}).get(mode_label)
-                if r:
-                    t = r.time
-                    vals: list = [t.mean, t.rms, t.peak, t.peak_to_peak, t.crest_factor]
-                    if has_band:
-                        vals.append(r.rms_in_band if r.rms_in_band is not None else "")
-                    for vi, v in enumerate(vals):
-                        cell_val = v if not isinstance(v, float) or np.isfinite(v) else ""
-                        ws.cell(row, col + vi, cell_val)
-                col += len(PARAM_NAMES)
+                inner_col = col
 
-        from openpyxl.utils import get_column_letter as _gcl
+                # С.Ш.В.
+                if self._calc_shv:
+                    if has_skz:
+                        for bi in range(n_bands):
+                            val = ""
+                            if r and bi < len(r.bands):
+                                v = r.bands[bi].rms
+                                val = v if np.isfinite(v) else ""
+                            c = ws.cell(row, inner_col + bi, val)
+                            c.alignment = center
+                        inner_col += n_bands
+                    if has_sxx:
+                        for bi in range(n_bands):
+                            val = ""
+                            if r and bi < len(r.bands):
+                                v = r.bands[bi].sxx
+                                val = v if np.isfinite(v) else ""
+                            c = ws.cell(row, inner_col + bi, val)
+                            c.alignment = center
+                        inner_col += n_bands
+
+                # Синусоидальная
+                if self._calc_sin:
+                    for fi in range(len(base_freqs)):
+                        sr = r.sinusoidal[fi] if r and fi < len(r.sinusoidal) else None
+                        if has_equiv:
+                            val = ""
+                            if sr and sr.equiv_amplitude is not None and np.isfinite(sr.equiv_amplitude):
+                                val = sr.equiv_amplitude
+                            c = ws.cell(row, inner_col, val)
+                            c.alignment = center
+                            inner_col += 1
+                        if has_eff:
+                            val = ""
+                            if sr and sr.eff_amplitude is not None and np.isfinite(sr.eff_amplitude):
+                                val = sr.eff_amplitude
+                            c = ws.cell(row, inner_col, val)
+                            c.alignment = center
+                            inner_col += 1
+
+                col += n_cols_per_graph
+
+        # Автоширина
         for ci in range(1, ws.max_column + 1):
-            max_len = max((len(str(ws.cell(r, ci).value or "")) for r in range(1, ws.max_row + 1)), default=8)
-            ws.column_dimensions[_gcl(ci)].width = min(30, max(10, max_len + 2))
+            max_len = 0
+            for ri in range(1, ws.max_row + 1):
+                val = ws.cell(ri, ci).value
+                if val is not None:
+                    s = f"{val:.6g}" if isinstance(val, float) else str(val)
+                    max_len = max(max_len, len(s))
+            ws.column_dimensions[_gcl(ci)].width = max(8, max_len + 3)
 
         try:
             wb.save(path)
