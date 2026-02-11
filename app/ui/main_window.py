@@ -220,6 +220,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Актуальные времена режимных переключений (обновляются при анализе и перетаскивании).
         self._mode_start_times: List[float] = []
         self._mode_end_times: List[float] = []
+        # Индекс и имя графика, использованного для анализа режима (исключается из расчётов).
+        self._mode_plot_idx: int | None = None
+        self._mode_series_name: str | None = None
 
         # загрузка пользовательских настроек
         self._load_user_settings()
@@ -387,23 +390,49 @@ class MainWindow(QtWidgets.QMainWindow):
                     return True
         return False
 
-    def _get_active_plots(self) -> list[tuple[int, str]]:
+    def _get_active_plots(self, exclude_mode: bool = False,
+                          name_only: bool = False) -> list[tuple[int, str]]:
         plots = []
         if hasattr(self.right, "_plots"):
             for order, idx in enumerate(sorted(self.right._plots.keys())):
-                # Стараться использовать осмысленные имена рядов из исходных файлов.
+                if exclude_mode:
+                    if self._mode_plot_idx is not None and idx == self._mode_plot_idx:
+                        continue
+                    # Дополнительная проверка по имени ряда (индекс может измениться после перезагрузки).
+                    if self._mode_series_name:
+                        s = self._plot_index_to_source.get(idx)
+                        if s and s[1] == self._mode_series_name:
+                            continue
                 src = self._plot_index_to_source.get(idx)
                 if src:
                     path, series_name = src
-                    try:
-                        fname = Path(path).name
-                    except Exception:
-                        fname = str(path)
-                    label = f"{fname} — {series_name}"
+                    if name_only:
+                        label = series_name
+                    else:
+                        try:
+                            fname = Path(path).name
+                        except Exception:
+                            fname = str(path)
+                        label = f"{fname} — {series_name}"
                 else:
                     label = f"График {order + 1}"
                 plots.append((idx, label))
         return plots
+
+    def get_mode_intervals(self) -> list[tuple[str, float, float]]:
+        """Возвращает список активных режимных интервалов: [(label, t_start, t_end), ...]."""
+        starts = sorted(self._mode_start_times)
+        ends = sorted(self._mode_end_times)
+        intervals: list[tuple[str, float, float]] = []
+        # Паруем: каждый start_times[i] с ближайшим end_times[j] > start_times[i].
+        used_ends: set[int] = set()
+        for s in starts:
+            for j, e in enumerate(ends):
+                if j not in used_ends and e > s:
+                    intervals.append((f"Р-{len(intervals) + 1}", s, e))
+                    used_ends.add(j)
+                    break
+        return intervals
 
     def get_plot_series_data(self, plot_idx: int):
         """Возвращает (x_data, y_data) для графика с индексом plot_idx или None."""
@@ -459,12 +488,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _open_calculation_dialog(self, title: str):
         if title == "Тензометрирование (прочность)":
-            plots = self._get_active_plots()
-            dlg = TensometryDialog(plots, self)
+            plots = self._get_active_plots(exclude_mode=True)
+            modes = self.get_mode_intervals()
+            dlg = TensometryDialog(plots, modes, self)
             dlg.exec_()
         elif title == "Виброметрирование (вибрации)":
-            plots = self._get_active_plots()
-            dlg = VibrometryDialog(plots, self)
+            plots = self._get_active_plots(exclude_mode=True)
+            modes = self.get_mode_intervals()
+            dlg = VibrometryDialog(plots, modes, self)
             dlg.exec_()
         elif title.startswith("Режим"):
             # Упрощённый сценарий: выбор одного ряда и сразу отрисовка режимного графика.
@@ -533,6 +564,8 @@ class MainWindow(QtWidgets.QMainWindow):
             mode_markers = {
                 "start_times": [float(t) for t in self._mode_start_times],
                 "end_times": [float(t) for t in self._mode_end_times],
+                "plot_idx": self._mode_plot_idx,
+                "series_name": self._mode_series_name,
             }
 
         return {"version": 1, "sources": sources, "plots": plots, "view": view,
@@ -642,6 +675,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if starts or ends:
                 self._mode_start_times = [float(t) for t in starts]
                 self._mode_end_times = [float(t) for t in ends]
+                mpidx = mode_markers.get("plot_idx")
+                if mpidx is not None:
+                    self._mode_plot_idx = int(mpidx)
+                msname = mode_markers.get("series_name")
+                if msname:
+                    self._mode_series_name = str(msname)
                 try:
                     self.right.add_mode_markers(self._mode_start_times, self._mode_end_times)
                 except Exception:
@@ -1423,9 +1462,12 @@ class MainWindow(QtWidgets.QMainWindow):
             elif sw.from_level > sw.to_level:
                 end_times.append(sw.t)
 
-        # Сохраняем времена режимов и отображаем маркеры.
+        # Сохраняем времена режимов, индекс и имя графика-режима, отображаем маркеры.
         self._mode_start_times = list(start_times)
         self._mode_end_times = list(end_times)
+        self._mode_plot_idx = int(plot_idx)
+        src = self._plot_index_to_source.get(int(plot_idx))
+        self._mode_series_name = src[1] if src else None
         if hasattr(self, "right") and hasattr(self.right, "add_mode_markers"):
             try:
                 self.right.add_mode_markers(start_times, end_times)
@@ -1493,211 +1535,40 @@ class CalculationWorker(QtCore.QObject):
         self.finished.emit("Расчет завершен. Логика режима пока не подключена.")
 
 
-class TensometryWorker(QtCore.QObject):
-    progress = QtCore.pyqtSignal(int)
-    finished = QtCore.pyqtSignal(str)
-    strain_result = QtCore.pyqtSignal(object)  # StrainResult
-
-    def __init__(self, y_data, miner_exponent: float = 5.0):
-        super().__init__()
-        self._y = np.asarray(y_data, dtype=float)
-        self._miner_exponent = float(miner_exponent)
-
-    @QtCore.pyqtSlot()
-    def run(self):
-        self.progress.emit(10)
-        r = compute_strain_characteristics(self._y, miner_exponent=self._miner_exponent)
-        self.progress.emit(100)
-        self.strain_result.emit(r)
-        self.finished.emit("Расчет характеристик тензосигнала завершен.")
-
-
 class TensometryBatchWorker(QtCore.QObject):
-    """Воркер: список (метка, массив y), показатель Минера → по одному результат на график."""
+    """Воркер: для каждой пары (график, режимный интервал) считает StrainResult."""
     progress = QtCore.pyqtSignal(int)
-    one_result = QtCore.pyqtSignal(str, object)  # label, StrainResult
-    finished = QtCore.pyqtSignal(str)
+    one_result = QtCore.pyqtSignal(str, str, object)  # graph_label, mode_label, StrainResult
+    finished = QtCore.pyqtSignal()
 
     def __init__(self, items: list, miner_exponent: float = 5.0):
         super().__init__()
-        self._items = list(items)  # [(label, y_array), ...]
+        # items: [(graph_label, mode_label, y_slice), ...]
+        self._items = list(items)
         self._miner_exponent = float(miner_exponent)
 
     @QtCore.pyqtSlot()
     def run(self):
         n = len(self._items)
-        for i, (label, y_arr) in enumerate(self._items):
+        for i, (graph_label, mode_label, y_arr) in enumerate(self._items):
             y = np.asarray(y_arr, dtype=float)
             r = compute_strain_characteristics(y, miner_exponent=self._miner_exponent)
-            self.one_result.emit(label, r)
+            self.one_result.emit(graph_label, mode_label, r)
             self.progress.emit(int((i + 1) * 100 / n) if n else 100)
-        self.finished.emit("Расчет завершен.")
-
-
-class TensometryDialog(QtWidgets.QDialog):
-    """Одно окно: выбор графиков (галочки), параметр Минера, кнопка «Рассчитать», блок результатов."""
-
-    def __init__(self, plots: list[tuple[int, str]], parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Тензометрирование (прочность)")
-        self.resize(520, 560)
-        self._plots = plots
-        self._worker_thread = None
-        self._worker = None
-
-        layout = QtWidgets.QVBoxLayout(self)
-
-        # --- Графики для анализа ---
-        grp_graphs = QtWidgets.QGroupBox("Графики для анализа")
-        grp_graphs_lay = QtWidgets.QVBoxLayout(grp_graphs)
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_select_all = QtWidgets.QPushButton("Выбрать все")
-        btn_select_none = QtWidgets.QPushButton("Снять все")
-        btn_select_all.clicked.connect(self._check_all_graphs)
-        btn_select_none.clicked.connect(self._uncheck_all_graphs)
-        btn_row.addWidget(btn_select_all)
-        btn_row.addWidget(btn_select_none)
-        btn_row.addStretch(1)
-        grp_graphs_lay.addLayout(btn_row)
-        self._graph_list = QtWidgets.QListWidget()
-        self._graph_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-        for idx, label in plots:
-            item = QtWidgets.QListWidgetItem(label)
-            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.Unchecked)
-            item.setData(QtCore.Qt.UserRole, idx)
-            self._graph_list.addItem(item)
-        if not plots:
-            self._graph_list.addItem(QtWidgets.QListWidgetItem("Нет активных графиков"))
-        grp_graphs_lay.addWidget(self._graph_list)
-        layout.addWidget(grp_graphs)
-
-        # --- Параметры ---
-        grp_params = QtWidgets.QGroupBox("Параметры")
-        params_lay = QtWidgets.QHBoxLayout(grp_params)
-        params_lay.addWidget(QtWidgets.QLabel("Показатель кривой Вёлера (m):"))
-        self._miner_spin = QtWidgets.QDoubleSpinBox()
-        self._miner_spin.setRange(2.0, 20.0)
-        self._miner_spin.setValue(5.0)
-        self._miner_spin.setDecimals(1)
-        params_lay.addWidget(self._miner_spin)
-        params_lay.addStretch(1)
-        layout.addWidget(grp_params)
-
-        # --- Рассчитать ---
-        self._progress = QtWidgets.QProgressBar()
-        self._progress.setRange(0, 100)
-        self._progress.setValue(0)
-        self._progress.setVisible(False)
-        self._calc_btn = QtWidgets.QPushButton("Рассчитать")
-        self._calc_btn.clicked.connect(self._run_calculation)
-        layout.addWidget(self._progress)
-        layout.addWidget(self._calc_btn)
-
-        # --- Результаты ---
-        grp_results = QtWidgets.QGroupBox("Результаты")
-        results_lay = QtWidgets.QVBoxLayout(grp_results)
-        self._results_text = QtWidgets.QTextEdit()
-        self._results_text.setReadOnly(True)
-        self._results_text.setPlaceholderText("Выберите графики, задайте параметр Минера и нажмите «Рассчитать».")
-        self._results_text.setMinimumHeight(200)
-        results_lay.addWidget(self._results_text)
-        layout.addWidget(grp_results)
-
-        # --- Закрыть ---
-        btn_close = QtWidgets.QPushButton("Закрыть")
-        btn_close.clicked.connect(self.accept)
-        layout.addWidget(btn_close)
-
-    def _check_all_graphs(self):
-        for i in range(self._graph_list.count()):
-            item = self._graph_list.item(i)
-            if item.data(QtCore.Qt.UserRole) is not None:
-                item.setCheckState(QtCore.Qt.Checked)
-
-    def _uncheck_all_graphs(self):
-        for i in range(self._graph_list.count()):
-            self._graph_list.item(i).setCheckState(QtCore.Qt.Unchecked)
-
-    def _run_calculation(self):
-        main_win = self.parent()
-        if not main_win or not hasattr(main_win, "get_plot_series_data"):
-            QtWidgets.QMessageBox.warning(self, "Ошибка", "Нет доступа к данным графика.")
-            return
-        checked = []
-        for i in range(self._graph_list.count()):
-            item = self._graph_list.item(i)
-            idx = item.data(QtCore.Qt.UserRole)
-            if idx is None:
-                continue
-            if item.flags() & QtCore.Qt.ItemIsUserCheckable and item.checkState() == QtCore.Qt.Checked:
-                label = item.text()
-                data = main_win.get_plot_series_data(idx)
-                if data is not None:
-                    x_data, y_data = data
-                    checked.append((label, y_data))
-                else:
-                    checked.append((label, None))
-        valid = [(lbl, y) for lbl, y in checked if y is not None]
-        if not valid:
-            msg = "Нет выбранных графиков с данными." if not checked else "Не удалось получить данные выбранных графиков."
-            QtWidgets.QMessageBox.warning(self, "Ошибка", msg)
-            return
-        miner = self._miner_spin.value()
-        self._results_text.clear()
-        self._progress.setVisible(True)
-        self._progress.setValue(0)
-        self._calc_btn.setEnabled(False)
-
-        self._worker_thread = QtCore.QThread(self)
-        self._worker = TensometryBatchWorker(valid, miner_exponent=miner)
-        self._worker.moveToThread(self._worker_thread)
-        self._worker_thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self._progress.setValue)
-        self._worker.one_result.connect(self._append_result)
-        self._worker.finished.connect(self._on_batch_finished)
-        self._worker.finished.connect(self._worker_thread.quit)
-        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
-        self._worker_thread.start()
-
-    def _append_result(self, label: str, r: StrainResult):
-        block = [
-            f"——— {label} ———",
-            f"  Минимум: {r.y_min:.6g}",
-            f"  Максимум: {r.y_max:.6g}",
-            f"  Среднее: {r.y_mean:.6g}",
-            f"  Число циклов: {r.n_cycles}",
-            f"  Макс. полуразмах: {r.max_half_range:.6g}",
-            f"  Мин. квазистатическое: {r.min_quasi_static:.6g}",
-            f"  Макс. квазистатическое: {r.max_quasi_static:.6g}",
-            f"  Эквив. полуразмах (кривая Вёлера): {r.equivalent_half_range:.6g}",
-            "",
-        ]
-        self._results_text.append("\n".join(block))
-
-    def _on_batch_finished(self, message: str):
-        self._progress.setValue(100)
-        self._progress.setVisible(False)
-        self._calc_btn.setEnabled(True)
-        self._worker_thread = None
-        self._worker = None
+        self.finished.emit()
 
 
 class VibrometryBatchWorker(QtCore.QObject):
-    """Воркер: список (метка, x, y), полоса f1–f2, длина сегмента → по одному VibrometryResult на график."""
+    """Воркер: для каждой пары (график, режимный интервал) считает VibrometryResult."""
     progress = QtCore.pyqtSignal(int)
-    one_result = QtCore.pyqtSignal(str, object)  # label, VibrometryResult
-    finished = QtCore.pyqtSignal(str)
+    one_result = QtCore.pyqtSignal(str, str, object)  # graph_label, mode_label, VibrometryResult
+    finished = QtCore.pyqtSignal()
 
-    def __init__(
-        self,
-        items: list,
-        band_f1_hz: float | None = None,
-        band_f2_hz: float | None = None,
-        segment_length: int | None = None,
-    ):
+    def __init__(self, items: list, band_f1_hz: float | None = None,
+                 band_f2_hz: float | None = None, segment_length: int | None = None):
         super().__init__()
-        self._items = list(items)  # [(label, x_array, y_array), ...]
+        # items: [(graph_label, mode_label, x_slice, y_slice), ...]
+        self._items = list(items)
         self._band_f1 = float(band_f1_hz) if band_f1_hz is not None else None
         self._band_f2 = float(band_f2_hz) if band_f2_hz is not None else None
         self._segment_length = int(segment_length) if segment_length and segment_length >= 4 else None
@@ -1705,75 +1576,312 @@ class VibrometryBatchWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run(self):
         n = len(self._items)
-        for i, (label, x_arr, y_arr) in enumerate(self._items):
+        for i, (graph_label, mode_label, x_arr, y_arr) in enumerate(self._items):
             x = np.asarray(x_arr, dtype=float)
             y = np.asarray(y_arr, dtype=float)
             fs = estimate_fs_from_time(x)
             if not np.isfinite(fs) or fs <= 0:
                 fs = 1000.0
-            r = compute_vibrometry(
-                y,
-                fs_hz=fs,
-                band_f1_hz=self._band_f1,
-                band_f2_hz=self._band_f2,
-                segment_length=self._segment_length,
-            )
-            self.one_result.emit(label, r)
+            r = compute_vibrometry(y, fs_hz=fs, band_f1_hz=self._band_f1,
+                                   band_f2_hz=self._band_f2, segment_length=self._segment_length)
+            self.one_result.emit(graph_label, mode_label, r)
             self.progress.emit(int((i + 1) * 100 / n) if n else 100)
-        self.finished.emit("Расчет завершен.")
+        self.finished.emit()
 
 
-class VibrometryDialog(QtWidgets.QDialog):
-    """Одно окно: выбор графиков (галочки), полоса частот, кнопка «Рассчитать», блок результатов."""
+def _make_checkbox_list(items: list[tuple], empty_msg: str) -> QtWidgets.QListWidget:
+    """Создаёт QListWidget с чекбоксами. items: [(data_value, label), ...]."""
+    lst = QtWidgets.QListWidget()
+    lst.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+    for data_val, label in items:
+        it = QtWidgets.QListWidgetItem(label)
+        it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+        it.setCheckState(QtCore.Qt.Unchecked)
+        it.setData(QtCore.Qt.UserRole, data_val)
+        lst.addItem(it)
+    if not items:
+        lst.addItem(QtWidgets.QListWidgetItem(empty_msg))
+    return lst
 
-    def __init__(self, plots: list[tuple[int, str]], parent=None):
+
+def _toggle_all(lst: QtWidgets.QListWidget, state: QtCore.Qt.CheckState):
+    for i in range(lst.count()):
+        it = lst.item(i)
+        if it.data(QtCore.Qt.UserRole) is not None:
+            it.setCheckState(state)
+
+
+def _get_checked(lst: QtWidgets.QListWidget) -> list[tuple]:
+    """Возвращает [(data_value, label), ...] для отмеченных элементов."""
+    result = []
+    for i in range(lst.count()):
+        it = lst.item(i)
+        dv = it.data(QtCore.Qt.UserRole)
+        if dv is not None and it.checkState() == QtCore.Qt.Checked:
+            result.append((dv, it.text()))
+    return result
+
+
+def _build_selection_tabs(
+    plots: list[tuple[int, str]],
+    modes: list[tuple[str, float, float]],
+) -> tuple[QtWidgets.QTabWidget, QtWidgets.QListWidget, QtWidgets.QListWidget]:
+    """Строит QTabWidget с вкладками «Графики» и «Режимы»."""
+    tabs = QtWidgets.QTabWidget()
+
+    # --- Вкладка «Графики» ---
+    graphs_page = QtWidgets.QWidget()
+    graphs_lay = QtWidgets.QVBoxLayout(graphs_page)
+    btn_row = QtWidgets.QHBoxLayout()
+    btn_all = QtWidgets.QPushButton("Выбрать все")
+    btn_none = QtWidgets.QPushButton("Снять все")
+    btn_row.addWidget(btn_all); btn_row.addWidget(btn_none); btn_row.addStretch(1)
+    graphs_lay.addLayout(btn_row)
+    graph_list = _make_checkbox_list(
+        [(idx, label) for idx, label in plots],
+        "Нет доступных графиков (исключая режимный)",
+    )
+    btn_all.clicked.connect(lambda: _toggle_all(graph_list, QtCore.Qt.Checked))
+    btn_none.clicked.connect(lambda: _toggle_all(graph_list, QtCore.Qt.Unchecked))
+    graphs_lay.addWidget(graph_list)
+    tabs.addTab(graphs_page, "Графики")
+
+    # --- Вкладка «Режимы» ---
+    modes_page = QtWidgets.QWidget()
+    modes_lay = QtWidgets.QVBoxLayout(modes_page)
+    btn_row_m = QtWidgets.QHBoxLayout()
+    btn_all_m = QtWidgets.QPushButton("Выбрать все")
+    btn_none_m = QtWidgets.QPushButton("Снять все")
+    btn_row_m.addWidget(btn_all_m); btn_row_m.addWidget(btn_none_m); btn_row_m.addStretch(1)
+    modes_lay.addLayout(btn_row_m)
+    mode_items = [(i, f"{label}  [{t0:.4g} – {t1:.4g} с]") for i, (label, t0, t1) in enumerate(modes)]
+    mode_list = _make_checkbox_list(mode_items, "Режимы не определены. Сначала выполните анализ режима.")
+    btn_all_m.clicked.connect(lambda: _toggle_all(mode_list, QtCore.Qt.Checked))
+    btn_none_m.clicked.connect(lambda: _toggle_all(mode_list, QtCore.Qt.Unchecked))
+    modes_lay.addWidget(mode_list)
+    tabs.addTab(modes_page, "Режимы")
+
+    return tabs, graph_list, mode_list
+
+
+class TensometryDialog(QtWidgets.QDialog):
+    """Тензометрирование: выбор графиков + режимов, параметр Минера, расчёт → экспорт в xlsx."""
+
+    def __init__(self, plots: list[tuple[int, str]],
+                 modes: list[tuple[str, float, float]], parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Виброметрирование (вибрации)")
-        self.resize(540, 600)
+        self.setWindowTitle("Тензометрирование (прочность)")
+        self.resize(540, 480)
         self._plots = plots
+        self._modes = modes
+        self._results: list[tuple[str, str, StrainResult]] = []  # (graph, mode, result)
         self._worker_thread = None
         self._worker = None
 
         layout = QtWidgets.QVBoxLayout(self)
 
-        # --- Графики для анализа ---
-        grp_graphs = QtWidgets.QGroupBox("Графики для анализа")
-        grp_graphs_lay = QtWidgets.QVBoxLayout(grp_graphs)
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_select_all = QtWidgets.QPushButton("Выбрать все")
-        btn_select_none = QtWidgets.QPushButton("Снять все")
-        btn_select_all.clicked.connect(self._check_all_graphs)
-        btn_select_none.clicked.connect(self._uncheck_all_graphs)
-        btn_row.addWidget(btn_select_all)
-        btn_row.addWidget(btn_select_none)
-        btn_row.addStretch(1)
-        grp_graphs_lay.addLayout(btn_row)
-        self._graph_list = QtWidgets.QListWidget()
-        self._graph_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-        for idx, label in plots:
-            item = QtWidgets.QListWidgetItem(label)
-            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.Unchecked)
-            item.setData(QtCore.Qt.UserRole, idx)
-            self._graph_list.addItem(item)
-        if not plots:
-            self._graph_list.addItem(QtWidgets.QListWidgetItem("Нет активных графиков"))
-        grp_graphs_lay.addWidget(self._graph_list)
-        layout.addWidget(grp_graphs)
+        # --- Вкладки: Графики / Режимы ---
+        self._tabs, self._graph_list, self._mode_list = _build_selection_tabs(plots, modes)
+        layout.addWidget(self._tabs)
+
+        # --- Параметры ---
+        grp_params = QtWidgets.QGroupBox("Параметры")
+        params_lay = QtWidgets.QHBoxLayout(grp_params)
+        params_lay.addWidget(QtWidgets.QLabel("Показатель кривой Вёлера (m):"))
+        self._miner_spin = QtWidgets.QDoubleSpinBox()
+        self._miner_spin.setRange(2.0, 20.0); self._miner_spin.setValue(5.0); self._miner_spin.setDecimals(1)
+        params_lay.addWidget(self._miner_spin); params_lay.addStretch(1)
+        layout.addWidget(grp_params)
+
+        # --- Рассчитать ---
+        self._progress = QtWidgets.QProgressBar()
+        self._progress.setRange(0, 100); self._progress.setValue(0); self._progress.setVisible(False)
+        self._calc_btn = QtWidgets.QPushButton("Рассчитать и сохранить в xlsx")
+        self._calc_btn.clicked.connect(self._run_calculation)
+        layout.addWidget(self._progress)
+        layout.addWidget(self._calc_btn)
+
+        btn_close = QtWidgets.QPushButton("Закрыть")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+    # --- расчёт ---
+    def _run_calculation(self):
+        main_win = self.parent()
+        if not main_win or not hasattr(main_win, "get_plot_series_data"):
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Нет доступа к данным графика.")
+            return
+
+        checked_graphs = _get_checked(self._graph_list)  # [(idx, label), ...]
+        checked_modes = _get_checked(self._mode_list)     # [(mode_index, label), ...]
+        if not checked_graphs:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Выберите хотя бы один график.")
+            return
+        if not checked_modes:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Выберите хотя бы один режим.")
+            return
+
+        # Собираем пары (graph × mode) и нарезаем данные по режимным интервалам.
+        items = []  # [(graph_label, mode_label, y_slice), ...]
+        # Для xlsx: маппинг полного имени → короткого (только имя ряда).
+        self._short_names: Dict[str, str] = {}
+        for g_idx, g_label in checked_graphs:
+            src = main_win._plot_index_to_source.get(g_idx)
+            self._short_names[g_label] = src[1] if src else g_label
+            data = main_win.get_plot_series_data(g_idx)
+            if data is None:
+                continue
+            x_data, y_data = data
+            x_arr = np.asarray(x_data)
+            y_arr = np.asarray(y_data)
+            for m_idx, m_label in checked_modes:
+                _label, t0, t1 = self._modes[m_idx]
+                i0 = int(np.searchsorted(x_arr, t0, side='left'))
+                i1 = int(np.searchsorted(x_arr, t1, side='right'))
+                y_slice = y_arr[i0:i1]
+                if y_slice.size == 0:
+                    continue
+                items.append((g_label, _label, y_slice))
+
+        if not items:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Нет данных в выбранных режимных интервалах.")
+            return
+
+        self._results.clear()
+        self._checked_graphs_labels = [lbl for _, lbl in checked_graphs]
+        self._checked_modes_labels = [self._modes[mi][0] for mi, _ in checked_modes]
+        self._progress.setVisible(True); self._progress.setValue(0)
+        self._calc_btn.setEnabled(False)
+
+        self._worker_thread = QtCore.QThread(self)
+        self._worker = TensometryBatchWorker(items, miner_exponent=self._miner_spin.value())
+        self._worker.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._progress.setValue)
+        self._worker.one_result.connect(self._collect_result)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.finished.connect(self._worker_thread.quit)
+        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker_thread.start()
+
+    def _collect_result(self, graph_label: str, mode_label: str, r: StrainResult):
+        self._results.append((graph_label, mode_label, r))
+
+    def _on_finished(self):
+        self._progress.setValue(100); self._progress.setVisible(False)
+        self._calc_btn.setEnabled(True)
+        if not self._results:
+            QtWidgets.QMessageBox.information(self, "Готово", "Нет результатов для сохранения.")
+            return
+        self._export_xlsx()
+
+    def _export_xlsx(self):
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Сохранить результаты", "", "Excel (*.xlsx);;Все файлы (*.*)")
+        if not path:
+            return
+
+        PARAM_NAMES = ["Мин.", "Макс.", "Среднее",
+                       "Экв. полураз.", "Макс. полураз.",
+                       "Мин. квазистат.", "Макс. квазистат."]
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Тензометрирование"
+        bold = Font(bold=True)
+        center = Alignment(horizontal='center')
+
+        # Группируем результаты: {graph_label: {mode_label: StrainResult}}
+        data_map: Dict[str, Dict[str, StrainResult]] = {}
+        for g, m, r in self._results:
+            data_map.setdefault(g, {})[m] = r
+
+        graphs = self._checked_graphs_labels
+        modes = self._checked_modes_labels
+        n_params = len(PARAM_NAMES)
+
+        # Заголовок: строка 1 — имена графиков, строка 2 — параметры.
+        c = ws.cell(1, 1, "Режим")
+        c.font = bold; c.alignment = center
+        col = 2
+        for g in graphs:
+            short = self._short_names.get(g, g)
+            ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + n_params - 1)
+            cell = ws.cell(1, col, short)
+            cell.font = bold; cell.alignment = center
+            for pi, pname in enumerate(PARAM_NAMES):
+                c2 = ws.cell(2, col + pi, pname)
+                c2.font = bold; c2.alignment = center
+            col += n_params
+
+        # Данные: строка за строкой по режимам.
+        for ri, mode_label in enumerate(modes):
+            row = ri + 3
+            mc = ws.cell(row, 1, mode_label)
+            mc.font = bold; mc.alignment = center
+            col = 2
+            for g in graphs:
+                r = data_map.get(g, {}).get(mode_label)
+                if r:
+                    vals = [r.y_min, r.y_max, r.y_mean,
+                            r.equivalent_half_range, r.max_half_range,
+                            r.min_quasi_static, r.max_quasi_static]
+                    for vi, v in enumerate(vals):
+                        cell_val = v if not isinstance(v, float) or np.isfinite(v) else ""
+                        dc = ws.cell(row, col + vi, cell_val)
+                        dc.alignment = center
+                col += n_params
+
+        # Автоширина столбцов по содержимому.
+        from openpyxl.utils import get_column_letter as _gcl
+        for ci in range(1, ws.max_column + 1):
+            max_len = 0
+            for ri in range(1, ws.max_row + 1):
+                val = ws.cell(ri, ci).value
+                if val is not None:
+                    s = f"{val:.6g}" if isinstance(val, float) else str(val)
+                    max_len = max(max_len, len(s))
+            ws.column_dimensions[_gcl(ci)].width = max(8, max_len + 3)
+
+        try:
+            wb.save(path)
+            QtWidgets.QMessageBox.information(self, "Готово", f"Результаты сохранены:\n{path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Ошибка сохранения", str(e))
+
+
+class VibrometryDialog(QtWidgets.QDialog):
+    """Виброметрирование: выбор графиков + режимов, полоса частот, расчёт → экспорт в xlsx."""
+
+    def __init__(self, plots: list[tuple[int, str]],
+                 modes: list[tuple[str, float, float]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Виброметрирование (вибрации)")
+        self.resize(540, 520)
+        self._plots = plots
+        self._modes = modes
+        self._results: list[tuple[str, str, VibrometryResult]] = []
+        self._worker_thread = None
+        self._worker = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # --- Вкладки: Графики / Режимы ---
+        self._tabs, self._graph_list, self._mode_list = _build_selection_tabs(plots, modes)
+        layout.addWidget(self._tabs)
 
         # --- Параметры ---
         grp_params = QtWidgets.QGroupBox("Параметры")
         params_lay = QtWidgets.QFormLayout(grp_params)
         self._f1_spin = QtWidgets.QDoubleSpinBox()
-        self._f1_spin.setRange(0.0, 1e6)
-        self._f1_spin.setValue(0.0)
-        self._f1_spin.setDecimals(2)
-        self._f1_spin.setSuffix(" Гц")
+        self._f1_spin.setRange(0.0, 1e6); self._f1_spin.setValue(0.0)
+        self._f1_spin.setDecimals(2); self._f1_spin.setSuffix(" Гц")
         self._f2_spin = QtWidgets.QDoubleSpinBox()
-        self._f2_spin.setRange(0.0, 1e6)
-        self._f2_spin.setValue(1000.0)
-        self._f2_spin.setDecimals(2)
-        self._f2_spin.setSuffix(" Гц")
+        self._f2_spin.setRange(0.0, 1e6); self._f2_spin.setValue(1000.0)
+        self._f2_spin.setDecimals(2); self._f2_spin.setSuffix(" Гц")
         self._use_band_cb = QtWidgets.QCheckBox("СКЗ в полосе частот (по PSD Уэлча)")
         self._use_band_cb.setChecked(True)
         params_lay.addRow("Полоса частот f₁:", self._f1_spin)
@@ -1783,110 +1891,159 @@ class VibrometryDialog(QtWidgets.QDialog):
 
         # --- Рассчитать ---
         self._progress = QtWidgets.QProgressBar()
-        self._progress.setRange(0, 100)
-        self._progress.setValue(0)
-        self._progress.setVisible(False)
-        self._calc_btn = QtWidgets.QPushButton("Рассчитать")
+        self._progress.setRange(0, 100); self._progress.setValue(0); self._progress.setVisible(False)
+        self._calc_btn = QtWidgets.QPushButton("Рассчитать и сохранить в xlsx")
         self._calc_btn.clicked.connect(self._run_calculation)
         layout.addWidget(self._progress)
         layout.addWidget(self._calc_btn)
-
-        # --- Результаты ---
-        grp_results = QtWidgets.QGroupBox("Результаты")
-        results_lay = QtWidgets.QVBoxLayout(grp_results)
-        self._results_text = QtWidgets.QTextEdit()
-        self._results_text.setReadOnly(True)
-        self._results_text.setPlaceholderText(
-            "Выберите графики, при необходимости задайте полосу частот и нажмите «Рассчитать»."
-        )
-        self._results_text.setMinimumHeight(220)
-        results_lay.addWidget(self._results_text)
-        layout.addWidget(grp_results)
 
         btn_close = QtWidgets.QPushButton("Закрыть")
         btn_close.clicked.connect(self.accept)
         layout.addWidget(btn_close)
 
-    def _check_all_graphs(self):
-        for i in range(self._graph_list.count()):
-            item = self._graph_list.item(i)
-            if item.data(QtCore.Qt.UserRole) is not None:
-                item.setCheckState(QtCore.Qt.Checked)
-
-    def _uncheck_all_graphs(self):
-        for i in range(self._graph_list.count()):
-            self._graph_list.item(i).setCheckState(QtCore.Qt.Unchecked)
-
+    # --- расчёт ---
     def _run_calculation(self):
         main_win = self.parent()
         if not main_win or not hasattr(main_win, "get_plot_series_data"):
             QtWidgets.QMessageBox.warning(self, "Ошибка", "Нет доступа к данным графика.")
             return
-        checked = []
-        for i in range(self._graph_list.count()):
-            item = self._graph_list.item(i)
-            idx = item.data(QtCore.Qt.UserRole)
-            if idx is None:
-                continue
-            if item.flags() & QtCore.Qt.ItemIsUserCheckable and item.checkState() == QtCore.Qt.Checked:
-                label = item.text()
-                data = main_win.get_plot_series_data(idx)
-                if data is not None:
-                    x_data, y_data = data
-                    checked.append((label, x_data, y_data))
-        if not checked:
-            QtWidgets.QMessageBox.warning(self, "Ошибка", "Нет выбранных графиков с данными.")
+
+        checked_graphs = _get_checked(self._graph_list)
+        checked_modes = _get_checked(self._mode_list)
+        if not checked_graphs:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Выберите хотя бы один график.")
+            return
+        if not checked_modes:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Выберите хотя бы один режим.")
             return
 
         band_f1 = self._f1_spin.value() if self._use_band_cb.isChecked() else None
         band_f2 = self._f2_spin.value() if self._use_band_cb.isChecked() else None
-        if self._use_band_cb.isChecked() and (band_f2 <= band_f1):
+        if self._use_band_cb.isChecked() and band_f2 is not None and band_f1 is not None and band_f2 <= band_f1:
             QtWidgets.QMessageBox.warning(self, "Ошибка", "Полоса частот: f₂ должна быть больше f₁.")
             return
 
-        self._results_text.clear()
-        self._progress.setVisible(True)
-        self._progress.setValue(0)
+        items = []  # [(graph_label, mode_label, x_slice, y_slice), ...]
+        self._short_names: Dict[str, str] = {}
+        for g_idx, g_label in checked_graphs:
+            src = main_win._plot_index_to_source.get(g_idx)
+            self._short_names[g_label] = src[1] if src else g_label
+            data = main_win.get_plot_series_data(g_idx)
+            if data is None:
+                continue
+            x_data, y_data = data
+            x_arr = np.asarray(x_data)
+            y_arr = np.asarray(y_data)
+            for m_idx, m_label in checked_modes:
+                _label, t0, t1 = self._modes[m_idx]
+                i0 = int(np.searchsorted(x_arr, t0, side='left'))
+                i1 = int(np.searchsorted(x_arr, t1, side='right'))
+                x_slice = x_arr[i0:i1]
+                y_slice = y_arr[i0:i1]
+                if y_slice.size == 0:
+                    continue
+                items.append((g_label, _label, x_slice, y_slice))
+
+        if not items:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Нет данных в выбранных режимных интервалах.")
+            return
+
+        self._results.clear()
+        self._checked_graphs_labels = [lbl for _, lbl in checked_graphs]
+        self._checked_modes_labels = [self._modes[mi][0] for mi, _ in checked_modes]
+        self._band_f1 = band_f1
+        self._band_f2 = band_f2
+        self._progress.setVisible(True); self._progress.setValue(0)
         self._calc_btn.setEnabled(False)
 
         self._worker_thread = QtCore.QThread(self)
-        self._worker = VibrometryBatchWorker(
-            checked,
-            band_f1_hz=band_f1,
-            band_f2_hz=band_f2,
-        )
+        self._worker = VibrometryBatchWorker(items, band_f1_hz=band_f1, band_f2_hz=band_f2)
         self._worker.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._progress.setValue)
-        self._worker.one_result.connect(self._append_result)
-        self._worker.finished.connect(self._on_batch_finished)
+        self._worker.one_result.connect(self._collect_result)
+        self._worker.finished.connect(self._on_finished)
         self._worker.finished.connect(self._worker_thread.quit)
         self._worker_thread.finished.connect(self._worker_thread.deleteLater)
         self._worker_thread.start()
 
-    def _append_result(self, label: str, r: VibrometryResult):
-        t = r.time
-        lines = [
-            f"——— {label} ———",
-            f"  Частота дискретизации: {r.fs_hz:.2f} Гц, отсчётов: {r.n_samples}",
-            "  Временные характеристики:",
-            f"    Среднее (μ): {t.mean:.6g}",
-            f"    СКЗ (x_rms): {t.rms:.6g}",
-            f"    Пик (max |x₀|): {t.peak:.6g}",
-            f"    Пик-пик: {t.peak_to_peak:.6g}",
-            f"    Пик-фактор (CF): {t.crest_factor:.6g}",
-        ]
-        if r.rms_in_band is not None and r.band_f1_hz is not None and r.band_f2_hz is not None:
-            lines.append(f"  СКЗ в полосе [{r.band_f1_hz:.2f}, {r.band_f2_hz:.2f}] Гц: {r.rms_in_band:.6g}")
-        lines.append("")
-        self._results_text.append("\n".join(lines))
+    def _collect_result(self, graph_label: str, mode_label: str, r: VibrometryResult):
+        self._results.append((graph_label, mode_label, r))
 
-    def _on_batch_finished(self, message: str):
-        self._progress.setValue(100)
-        self._progress.setVisible(False)
+    def _on_finished(self):
+        self._progress.setValue(100); self._progress.setVisible(False)
         self._calc_btn.setEnabled(True)
-        self._worker_thread = None
-        self._worker = None
+        if not self._results:
+            QtWidgets.QMessageBox.information(self, "Готово", "Нет результатов для сохранения.")
+            return
+        self._export_xlsx()
+
+    def _export_xlsx(self):
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Сохранить результаты", "", "Excel (*.xlsx);;Все файлы (*.*)")
+        if not path:
+            return
+
+        PARAM_NAMES = ["Среднее (μ)", "СКЗ (x_rms)", "Пик (max|x₀|)",
+                       "Пик-пик", "Пик-фактор (CF)"]
+        has_band = self._band_f1 is not None and self._band_f2 is not None
+        if has_band:
+            PARAM_NAMES.append(f"СКЗ [{self._band_f1:.0f}–{self._band_f2:.0f}] Гц")
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Виброметрирование"
+        bold = Font(bold=True)
+        center = Alignment(horizontal='center')
+
+        data_map: Dict[str, Dict[str, VibrometryResult]] = {}
+        for g, m, r in self._results:
+            data_map.setdefault(g, {})[m] = r
+
+        graphs = self._checked_graphs_labels
+        modes = self._checked_modes_labels
+
+        c0 = ws.cell(1, 1, "Режим")
+        c0.font = bold; c0.alignment = center
+        col = 2
+        for g in graphs:
+            short = self._short_names.get(g, g)
+            ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + len(PARAM_NAMES) - 1)
+            cell = ws.cell(1, col, short)
+            cell.font = bold; cell.alignment = center
+            for pi, pname in enumerate(PARAM_NAMES):
+                ws.cell(2, col + pi, pname).font = bold
+            col += len(PARAM_NAMES)
+
+        for ri, mode_label in enumerate(modes):
+            row = ri + 3
+            ws.cell(row, 1, mode_label).font = bold
+            col = 2
+            for g in graphs:
+                r = data_map.get(g, {}).get(mode_label)
+                if r:
+                    t = r.time
+                    vals: list = [t.mean, t.rms, t.peak, t.peak_to_peak, t.crest_factor]
+                    if has_band:
+                        vals.append(r.rms_in_band if r.rms_in_band is not None else "")
+                    for vi, v in enumerate(vals):
+                        cell_val = v if not isinstance(v, float) or np.isfinite(v) else ""
+                        ws.cell(row, col + vi, cell_val)
+                col += len(PARAM_NAMES)
+
+        from openpyxl.utils import get_column_letter as _gcl
+        for ci in range(1, ws.max_column + 1):
+            max_len = max((len(str(ws.cell(r, ci).value or "")) for r in range(1, ws.max_row + 1)), default=8)
+            ws.column_dimensions[_gcl(ci)].width = min(30, max(10, max_len + 2))
+
+        try:
+            wb.save(path)
+            QtWidgets.QMessageBox.information(self, "Готово", f"Результаты сохранены:\n{path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Ошибка сохранения", str(e))
 
 
 class CalculationDialog(QtWidgets.QDialog):
