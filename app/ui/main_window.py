@@ -235,8 +235,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.right.sigCursorMoved.connect(self.coords.update_cursor_position)
         self.right.sigModeTimesChanged.connect(self._on_mode_times_changed)
 
+        # Оборачиваем график + горизонтальный скролл-бар в контейнер
+        plot_container = QtWidgets.QWidget()
+        plot_lay = QtWidgets.QVBoxLayout(plot_container)
+        plot_lay.setContentsMargins(0, 0, 0, 0)
+        plot_lay.setSpacing(0)
+        plot_lay.addWidget(self.right, 1)
+
+        self._x_scrollbar = QtWidgets.QScrollBar(QtCore.Qt.Horizontal)
+        self._x_scrollbar.setMinimum(0)
+        self._x_scrollbar.setMaximum(0)  # обновится при добавлении данных
+        self._x_scrollbar_updating = False  # защита от рекурсивных обновлений
+        self._x_scrollbar.valueChanged.connect(self._on_x_scrollbar_moved)
+        self.right.sigXRangeChanged.connect(self._on_plot_x_range_changed)
+        plot_lay.addWidget(self._x_scrollbar)
+
         layout.addWidget(self.left, 1)
-        layout.addWidget(self.right, 4)
+        layout.addWidget(plot_container, 4)
         layout.addWidget(self.coords, 1)
 
         self._load_mode = getattr(self, "_load_mode", "lazy")  # "lazy" | "preload_all"
@@ -337,6 +352,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg._start_time = time.monotonic()  # type: ignore[attr-defined]
         timer = QtCore.QTimer(dlg)
         timer.setInterval(1000)
+        
 
         def _update_title():
             try:
@@ -1542,6 +1558,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mode_end_times = [float(t) for t in end_times]
         self._project_dirty = True
 
+    # --- Горизонтальный скролл-бар ---
+    def _on_plot_x_range_changed(self, x_min: float, x_max: float, data_x_max: float):
+        """Синхронизирует скролл-бар с текущим видимым диапазоном графика."""
+        if self._x_scrollbar_updating:
+            return
+        self._x_scrollbar_updating = True
+        try:
+            view_span = x_max - x_min
+            total = max(data_x_max, x_max)
+            SCALE = 10000
+            if total <= 0 or view_span >= total:
+                self._x_scrollbar.setMaximum(0)
+                self._x_scrollbar.setValue(0)
+            else:
+                page = int(view_span / total * SCALE)
+                sb_max = SCALE - page
+                self._x_scrollbar.setPageStep(page)
+                self._x_scrollbar.setSingleStep(max(1, page // 10))
+                self._x_scrollbar.setMaximum(max(0, sb_max))
+                pos = int(x_min / (total - view_span) * sb_max) if (total - view_span) > 0 else 0
+                self._x_scrollbar.setValue(max(0, min(sb_max, pos)))
+        finally:
+            self._x_scrollbar_updating = False
+
+    def _on_x_scrollbar_moved(self, value: int):
+        """Перемещает видимый диапазон графика при движении скролл-бара."""
+        if self._x_scrollbar_updating:
+            return
+        self._x_scrollbar_updating = True
+        try:
+            sb_max = self._x_scrollbar.maximum()
+            if sb_max <= 0:
+                return
+            view_span = self.right._x_max - self.right._x_min
+            total = max(self.right._data_x_max, self.right._x_max)
+            scroll_range = total - view_span
+            if scroll_range <= 0:
+                return
+            new_x_min = (value / sb_max) * scroll_range
+            self.right.set_x_range_direct(new_x_min, new_x_min + view_span)
+        finally:
+            self._x_scrollbar_updating = False
+
     # --- Settings ---
     def _load_user_settings(self):
         try:
@@ -1778,10 +1837,6 @@ class TensometryDialog(QtWidgets.QDialog):
         self._calc_btn.clicked.connect(self._run_calculation)
         layout.addWidget(self._progress)
         layout.addWidget(self._calc_btn)
-
-        btn_close = QtWidgets.QPushButton("Закрыть")
-        btn_close.clicked.connect(self.accept)
-        layout.addWidget(btn_close)
 
     # --- расчёт ---
     def _run_calculation(self):
@@ -2176,10 +2231,6 @@ class VibrometryDialog(QtWidgets.QDialog):
         self._calc_btn.clicked.connect(self._run_calculation)
         root.addWidget(self._progress)
         root.addWidget(self._calc_btn)
-
-        btn_close = QtWidgets.QPushButton("Закрыть")
-        btn_close.clicked.connect(self.accept)
-        root.addWidget(btn_close)
 
     # ---------- toggle helpers ----------
     def _on_shv_toggled(self, checked: bool):

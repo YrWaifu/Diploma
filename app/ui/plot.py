@@ -70,6 +70,8 @@ class DataPlot(pg.PlotWidget):
     sigCursorMoved = QtCore.pyqtSignal(float, int)
     # Сигнал: списки времён начала и окончания режимов обновились (после перетаскивания линии).
     sigModeTimesChanged = QtCore.pyqtSignal(list, list)
+    # Сигнал: видимый x-диапазон изменился → (x_min, x_max, data_x_max).
+    sigXRangeChanged = QtCore.pyqtSignal(float, float, float)
 
     def __init__(self, parent=None):
         self.vb = XZoomViewBox()
@@ -82,6 +84,7 @@ class DataPlot(pg.PlotWidget):
         self._x_half_range = 10.0
         self._x_min = 0.0
         self._x_max = 20.0
+        self._data_x_max = 20.0  # максимум по данным (полный диапазон)
         self._initialized = False
         # Частота отрисовки линий курсора не ограничивается, чтобы движение было плавным.
         # Частота обновления координат (emit в панель) ограничена отдельно.
@@ -134,7 +137,6 @@ class DataPlot(pg.PlotWidget):
         self.sigXHalfRangeChanged.emit(self._x_half_range)
 
     def set_x_range_direct(self, xmin: float, xmax: float):
-        # Левую границу фиксируем в 0; правая — как задано (или чуть больше 0)
         x0 = max(0.0, float(xmin))
         x1 = float(xmax)
         if not np.isfinite(x0) or not np.isfinite(x1):
@@ -147,6 +149,7 @@ class DataPlot(pg.PlotWidget):
         if self._initialized:
             self._apply_ranges()
             self._replot_all()
+        self.sigXRangeChanged.emit(self._x_min, self._x_max, self._data_x_max)
 
     def add_or_update_plot(self, idx: int, x_data, y_data, y1: int, y2: int, color, y_min: float | None = None, y_max: float | None = None):
         was_empty = len(self._plots) == 0
@@ -166,6 +169,15 @@ class DataPlot(pg.PlotWidget):
             y_data_min=y_min,
             y_data_max=y_max,
         )
+        # Обновляем глобальный максимум по X среди всех графиков
+        try:
+            x_arr = np.asarray(x_data)
+            if x_arr.size:
+                xm = float(np.max(x_arr))
+                if np.isfinite(xm) and xm > self._data_x_max:
+                    self._data_x_max = xm
+        except Exception:
+            pass
         if idx not in self._curves:
             self._curves[idx] = self.plot(pen=pg.mkPen(color, width=2), clipToView=True, autoDownsample=True)
         else:
@@ -276,7 +288,7 @@ class DataPlot(pg.PlotWidget):
 
     def set_x_zero_to_data_max(self, padding_ratio: float = 0.02):
         if not self._plots:
-            # если данных нет — дефолт [0; 20]
+            self._data_x_max = 20.0
             self.set_x_range_direct(0.0, 20.0)
             return
         x_maxs = []
@@ -285,12 +297,15 @@ class DataPlot(pg.PlotWidget):
             if x_arr.size:
                 x_maxs.append(float(np.max(x_arr)))
         if not x_maxs:
+            self._data_x_max = 20.0
             self.set_x_range_direct(0.0, 20.0)
             return
         xmax = max(x_maxs)
         if not np.isfinite(xmax):
+            self._data_x_max = 20.0
             self.set_x_range_direct(0.0, 20.0)
             return
+        self._data_x_max = xmax
         span = max(1e-12, xmax - 0.0)
         pad_right = span * float(padding_ratio)
         self.set_x_range_direct(0.0, xmax + pad_right)
