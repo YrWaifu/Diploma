@@ -1,8 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-Виброметрия: временные характеристики, PSD (Уэлч), СКЗ в полосе.
-Формулы по документу ВКР (обозначения, спектр, PSD, связь PSD–СКЗ).
-"""
+"""Виброанализ: время, спектр Уэлча, СКЗ в полосах, синусоидальная модель."""
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple, Optional
@@ -11,7 +8,7 @@ import numpy as np
 
 @dataclass
 class VibrometryTimeResult:
-    """Временные характеристики по документу: μ, x₀, СКЗ, пик, пик-пик, пик-фактор."""
+    """Время: среднее, СКЗ по центрированному, пик, размах, пик-фактор."""
     mean: float          # μ = (1/N) Σ x[n]
     rms: float           # СКЗ по центрированному сигналу
     peak: float          # max |x₀[n]|
@@ -21,7 +18,7 @@ class VibrometryTimeResult:
 
 @dataclass
 class VibrometryResult:
-    """Результат анализа вибросигнала: временные характеристики + опционально СКЗ в полосе."""
+    """Время + опционально СКЗ в полосе по PSD."""
     time: VibrometryTimeResult
     fs_hz: float
     n_samples: int
@@ -32,11 +29,7 @@ class VibrometryResult:
 
 
 def compute_time_characteristics(x: np.ndarray) -> VibrometryTimeResult:
-    """
-    Временные характеристики по документу:
-    μ = (1/N) Σ x[n], x₀[n] = x[n] - μ,
-    x_rms = √[(1/N) Σ x₀²[n]], x_peak = max |x₀[n]|, x_pp = max x₀ - min x₀, CF = x_peak / x_rms.
-    """
+    """Центрированный СКЗ, |x−mean|_max, размах, пик-фактор."""
     x = np.asarray(x, dtype=float)
     if x.size == 0:
         return VibrometryTimeResult(mean=np.nan, rms=np.nan, peak=np.nan, peak_to_peak=np.nan, crest_factor=np.nan)
@@ -64,11 +57,7 @@ def psd_welch(
     overlap_ratio: float = 0.5,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    PSD методом Уэлча по документу.
-    Периодограмма сегмента: P_xx(f) = (1/(fs*U)) * |X_w(f)|², U = (1/L) Σ w²[n].
-    Уэлч: P̂_xx(f) = (1/M) Σ P_xx^(m)(f).
-
-    Возвращает (freqs, P_xx): частоты в Гц и оценка PSD в единицах²/Гц.
+    Оценка PSD Уэлча; на выходе частоты (Гц) и P_xx (ед²/Гц).
     """
     x = np.asarray(x, dtype=float)
     n = x.size
@@ -88,7 +77,7 @@ def psd_welch(
     while start + L <= n:
         seg = x0[start : start + L] * w
         X = np.fft.rfft(seg)
-        # Периодограмма по документу P_xx(f) = (1/(fs*U)) * |X_w|²; односторонняя: ×2 для f∈(0,fs/2), ×1/L по Parseval (sum P*Δf = x_rms²)
+        # Односторонний периодограммный масштаб; DC и Найквист без удвоения
         P_seg = (2.0 / (fs_hz * U * L)) * (np.abs(X) ** 2)
         P_seg[0] *= 0.5   # DC без удвоения
         if P_seg.size > 1 and L % 2 == 0:
@@ -111,8 +100,7 @@ def rms_in_band_from_psd(
     segment_length: int,
 ) -> float:
     """
-    СКЗ в полосе по документу: x_rms = √(Σ P̂_xx[k] * Δf), k ∈ [f1, f2].
-    Δf = fs / N для сегмента длины N (разрешение по частоте Уэлча).
+    СКЗ в полосе из PSD: √(Σ P_xx Δf), Δf = fs / длина сегмента.
     """
     if freqs.size == 0 or P_xx.size == 0 or f2_hz <= f1_hz or segment_length < 2:
         return np.nan
@@ -159,9 +147,6 @@ def compute_vibrometry(
     )
 
 
-# ---------------------------------------------------------------------------
-# Расширенный анализ: С.Ш.В. (полосовой) + Синусоидальная вибрация
-# ---------------------------------------------------------------------------
 
 @dataclass
 class BandResult:

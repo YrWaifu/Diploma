@@ -1,8 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-Обработка тензометрических сигналов (по разделу 2.3.1 диплома).
-Вход: массив отсчётов y (и при необходимости время t). Выход: числовые характеристики.
-"""
+"""Статистика по участку тензосигнала: экстремумы, циклы, полуразмахи, эквивалент Минера."""
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -11,7 +8,7 @@ import numpy as np
 
 @dataclass
 class StrainResult:
-    """Результат расчёта характеристик тензосигнала на участке."""
+    """Один участок: экстремумы, число циклов, полуразмахи, квазистатика, Минер."""
     y_min: float
     y_max: float
     y_mean: float
@@ -27,25 +24,7 @@ def compute_strain_characteristics(
     miner_exponent: float = 5.0,
     min_prominence: float | None = None,
 ) -> StrainResult:
-    """
-    Вычисляет набор характеристик тензосигнала на участке обработки.
-
-    Параметры:
-    ----------
-    y : np.ndarray
-        Массив отсчётов (деформации/напряжения).
-    miner_exponent : float
-        Показатель степени m в гипотезе Минера для эквивалентного полуразмаха (по умолчанию 5).
-    min_prominence : float | None
-        Минимальная «выпуклость» экстремума, чтобы не считать шум циклом.
-        Если None — 1% от размаха (y_max - y_min) по всему участку.
-
-    Возвращает:
-    -----------
-    StrainResult
-        Минимум, максимум, среднее, число циклов, макс. полуразмах,
-        мин/макс квазистатика, эквивалентный полуразмах (Минера).
-    """
+    """Экстремумы, циклы по парам экстремумов, полуразмахи и квазистатика, эквивалент Минера."""
     y = np.asarray(y, dtype=float)
     if y.size == 0:
         return StrainResult(
@@ -78,7 +57,7 @@ def compute_strain_characteristics(
     min_qs = float(np.min(quasi_statics))
     max_qs = float(np.max(quasi_statics))
 
-    # По формуле из ВКР: a_eq = ((1/M) * Σ a_k^m)^(1/m)
+    # Эквивалентный полуразмах (Минер): a_eq = ((1/M) * Σ a_k^m)^(1/m)
     a_arr = np.array(half_ranges, dtype=float)
     m = float(miner_exponent)
     if m <= 0 or not np.isfinite(m):
@@ -148,10 +127,7 @@ def _cycles_from_extrema(
     y: np.ndarray,
     extrema: List[Tuple[int, str]],
 ) -> Tuple[List[float], List[float]]:
-    """
-    По списку экстремумов (индекс, тип) формирует циклы: полуразмах и квазистатическое значение.
-    Цикл — два подряд идущих экстремума противоположного типа.
-    """
+    """Полуразмах и квазистатика для каждой пары соседних экстремумов разного типа."""
     half_ranges: List[float] = []
     quasi_statics: List[float] = []
 
@@ -170,12 +146,9 @@ def _cycles_from_extrema(
     return half_ranges, quasi_statics
 
 
-# --- Самопроверка: запуск модуля как скрипта ---
 if __name__ == "__main__":
-    # Простой тестовый сигнал: несколько «циклов» (пики и впадины)
     np.random.seed(42)
     t = np.linspace(0, 10, 500)
-    # Синус с шумом — даёт чередующиеся макс/мин
     y = 100 * np.sin(2 * np.pi * 0.5 * t) + 2 * np.random.randn(len(t))
 
     r = compute_strain_characteristics(y, miner_exponent=5.0)
@@ -190,4 +163,4 @@ if __name__ == "__main__":
     print(f"  equivalent_half_range (Miner) = {r.equivalent_half_range:.4f}")
     assert r.n_cycles >= 1
     assert r.y_min <= r.y_mean <= r.y_max
-    print("OK: self-check passed.")
+    print("Проверка strain.py: ок.")

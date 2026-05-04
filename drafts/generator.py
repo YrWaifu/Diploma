@@ -16,7 +16,7 @@ import argparse
 import math
 import numpy as np
 
-# ---------- сигналогенератор: 7 серий на одинаковой временной сетке ----------
+# Сигналогенератор: 7 рядов на одной оси времени
 def synth_series(t: np.ndarray, k: int, base_seed: int = 12345) -> np.ndarray:
     rng = np.random.default_rng(base_seed + k)
     # частоты/фазы/амплитуды немного разные для каждой серии

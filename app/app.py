@@ -1,4 +1,4 @@
-# entrypoint: python -m app.app или python app/app.py
+# Запуск: python -m app.app
 import sys
 from PyQt5 import QtWidgets
 import pyqtgraph as pg

@@ -6,6 +6,15 @@ import pyqtgraph as pg
 import numpy as np
 import tempfile
 import time
+import logging
+import traceback
+
+log = logging.getLogger("secsig")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    log.addHandler(_h)
+    log.setLevel(logging.DEBUG)
 
 from app.ui.left_panel import DotsCanvas, Stick
 from app.ui.mode_dialog import ModeDialog
@@ -28,7 +37,7 @@ from app.processing import (
 
 
 class _PreloadWorker(QtCore.QObject):
-    """Воркер предзагрузки файла в фоне, чтобы не блокировать GUI (оценка размера + чтение X и всех Y)."""
+    """Предзагрузка X и всех Y в фоновом потоке."""
     progress_value = QtCore.pyqtSignal(int)
     progress_label = QtCore.pyqtSignal(str)
     progress_range = QtCore.pyqtSignal(int)
@@ -62,12 +71,14 @@ class _PreloadWorker(QtCore.QObject):
                     x_tmp = self._provider.ensure_x_loaded()
                     total_rows = len(x_tmp) if hasattr(x_tmp, "__len__") else 0
                 except Exception:
+                    log.exception("preload: ensure_x_loaded for row count")
                     total_rows = 0
         except InterruptedError:
             self._canceled = True
             self.finished_signal.emit(True)
             return
         except Exception:
+            log.exception("preload: estimate_rows")
             total_rows = 0
 
         units_total = total_rows * (1 + len(self._series_list))
@@ -90,28 +101,31 @@ class _PreloadWorker(QtCore.QObject):
             self.finished_signal.emit(True)
             return
         except Exception:
+            log.exception("preload: ensure_x_loaded")
             self.finished_signal.emit(True)
             return
 
         base_offset = total_rows if total_rows > 0 else 0
-        for desc in self._series_list:
+        for si, desc in enumerate(self._series_list):
             if self._canceled:
                 self.finished_signal.emit(True)
                 return
-            self.progress_label.emit(f"{self._file_path.name}: {desc['name']}")
+            series_name = desc['name']
+            self.progress_label.emit(f"{self._file_path.name}: {series_name}")
             try:
                 def cb_y(done, total, _label):
                     if units_total > 0:
                         self.progress_value.emit(base_offset + int(min(done, total) if total else done))
-                        self.progress_label.emit(f"{self._file_path.name}: {desc['name']} {done}/{total} ({int((done / max(1, total)) * 100)}%)")
+                        self.progress_label.emit(f"{self._file_path.name}: {series_name} {done}/{total} ({int((done / max(1, total)) * 100)}%)")
 
-                self._provider.load_y(desc['name'], progress=cb_y, total_hint=total_rows or None)
+                self._provider.load_y(series_name, progress=cb_y, total_hint=total_rows or None)
                 base_offset += total_rows if total_rows > 0 else 0
             except InterruptedError:
                 self._canceled = True
                 self.finished_signal.emit(True)
                 return
             except Exception:
+                log.exception("preload: load_y %s", series_name)
                 continue
 
         if units_total > 0:
@@ -120,7 +134,7 @@ class _PreloadWorker(QtCore.QObject):
 
 
 class _RestoreProjectWorker(QtCore.QObject):
-    """Воркер восстановления проекта: загрузка рядов в фоне с прогрессом, без зависания GUI."""
+    """Восстановление рядов проекта в фоне с прогрессом."""
     progress_value = QtCore.pyqtSignal(int)
     progress_label = QtCore.pyqtSignal(str)
     progress_range = QtCore.pyqtSignal(int)
@@ -188,7 +202,7 @@ class _RestoreProjectWorker(QtCore.QObject):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ODiploma")
+        self.setWindowTitle("SecSig")
         self.resize(1400, 700)
 
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
@@ -199,43 +213,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.right = DataPlot()
         self.coords = CoordinatesPanel()
 
-        # ????????? ????????????
-        self._settings = QtCore.QSettings("ODiploma", "ODiploma")
+        self._settings = QtCore.QSettings("SecSig", "SecSig")
 
-        # ????????? ??????????????? ?????? (??? ?????????)
-        # self._datasets: ?????? ???????? { 'path': Path, 'series': List[descriptor] }
-        # descriptor: { 'key': str, 'file': Path, 'name': str, 'x': np.ndarray, 'y': np.ndarray }
+        # Открытые файлы: path + список рядов
         self._datasets: List[Dict] = []
         self._plotted_keys: set[str] = set()
-        # ?????????? ??????? ???????? ?? ??????
         self._providers: Dict[Path, object] = {}
-        # MRU-??????? ????????, ??????? ?????? Y ? RAM (??????? ?????-???????: ??????->?????)
+        # LRU индексов графиков при ограничении числа рядов в RAM
         self._memory_mru: List[int] = []
-        # ????????? ????? ??? ?????????? ? memmap ????????: idx -> (y_tmp_path)
         self._plot_tmp_paths: Dict[int, str] = {}
-        # ????? RAM-???????? (????? ???? ????????????? ???????????)
         self._max_memory_series: int = 7
-        # для сохранения проекта: idx -> (path, series_name)
         self._plot_index_to_source: Dict[int, tuple] = {}
-        # путь текущего проекта (для «Сохранить»)
         self._project_path: Path | None = None
-        # проект изменён после последнего сохранения (для подтверждения при закрытии)
         self._project_dirty: bool = False
-        # Актуальные времена режимных переключений (обновляются при анализе и перетаскивании).
         self._mode_start_times: List[float] = []
         self._mode_end_times: List[float] = []
-        # Индекс и имя графика, использованного для анализа режима (исключается из расчётов).
+        # График, по которому строилась шкала режимов (не в сводных расчётах)
         self._mode_plot_idx: int | None = None
         self._mode_series_name: str | None = None
 
-        # загрузка пользовательских настроек
         self._load_user_settings()
 
         self.left.stickUpdated.connect(self.on_stick_updated)
         self.right.sigCursorMoved.connect(self.coords.update_cursor_position)
         self.right.sigModeTimesChanged.connect(self._on_mode_times_changed)
 
-        # Оборачиваем график + горизонтальный скролл-бар в контейнер
         plot_container = QtWidgets.QWidget()
         plot_lay = QtWidgets.QVBoxLayout(plot_container)
         plot_lay.setContentsMargins(0, 0, 0, 0)
@@ -263,7 +265,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.right.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.right.customContextMenuRequested.connect(lambda pos: self._show_plot_context_menu(self.right, pos))
 
-    # Единый стиль прогресс-диалогов (чтобы было понятно, что идёт загрузка, а не зависание)
     _PROGRESS_STYLE = """
         QProgressDialog {
             background-color: #fafafa;
@@ -306,12 +307,7 @@ class MainWindow(QtWidgets.QMainWindow):
         maximum: int = 0,
         min_duration_ms: int = 0,
     ) -> QtWidgets.QProgressDialog:
-        """Создаёт прогресс-диалог в едином стиле приложения.
-
-        ВАЖНО: после нажатия «Отмена» диалог игнорирует все входящие
-        setValue / setLabelText / setRange, чтобы рабочий поток не мог
-        «воскресить» уже отменённый диалог (известная особенность Qt).
-        """
+        """Прогресс-диалог; после «Отмена» обёртки блокируют обновления со стороны потока (Qt)."""
         dlg = QtWidgets.QProgressDialog(label_text, "Отмена", 0, maximum, self)
         dlg._base_title = title  # type: ignore[attr-defined]
         dlg._user_canceled = False  # type: ignore[attr-defined]
@@ -322,7 +318,6 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.setAutoClose(False)
         dlg.setAutoReset(False)
 
-        # --- Перехватываем отмену, чтобы заблокировать входящие обновления ---
         _orig_setValue = dlg.setValue
         _orig_setLabelText = dlg.setLabelText
         _orig_setRange = dlg.setRange
@@ -699,8 +694,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def on_finished(_canceled: bool):
             thread.quit()
-            event_loop.quit()
+            # Отключаем canceled ПЕРЕД close(), чтобы Qt не эмитил ложную отмену
+            try:
+                progress_dlg.canceled.disconnect(on_cancel)
+            except (TypeError, RuntimeError):
+                pass
             progress_dlg.close()
+            event_loop.quit()
 
         def on_cancel():
             worker.request_cancel()
@@ -753,7 +753,7 @@ class MainWindow(QtWidgets.QMainWindow):
             state = self.get_project_state()
             try:
                 save_project(state, self._project_path)
-                self.setWindowTitle(f"ODiploma — {self._project_path.name}")
+                self.setWindowTitle(f"SecSig — {self._project_path.name}")
                 self._project_dirty = False
                 self._add_to_recent(self._project_path)
                 return True
@@ -779,7 +779,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             save_project(state, path)
             self._project_path = path
-            self.setWindowTitle(f"ODiploma — {path.name}")
+            self.setWindowTitle(f"SecSig — {path.name}")
             self._project_dirty = False
             self._add_to_recent(path)
             return True
@@ -848,7 +848,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.apply_project_state(state)
                 self._project_path = path
                 self._project_dirty = False
-                self.setWindowTitle(f"ODiploma — {path.name}")
+                self.setWindowTitle(f"SecSig — {path.name}")
                 self._add_to_recent(path)
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "Ошибка открытия проекта", str(e))
@@ -900,7 +900,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.apply_project_state(state)
                 self._project_path = path
                 self._project_dirty = False
-                self.setWindowTitle(f"ODiploma — {path.name}")
+                self.setWindowTitle(f"SecSig — {path.name}")
                 self._add_to_recent(path)
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "Ошибка открытия проекта", str(e))
@@ -911,26 +911,40 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_data_from_paths(self, filepaths: List[Path]) -> None:
         """Импорт данных по списку путей (без диалога)."""
+        log.info("=== _load_data_from_paths START ===")
+        log.info(f"  filepaths={[str(p) for p in filepaths]}")
+        log.info(f"  _load_mode={self._load_mode!r}")
         if not filepaths:
+            log.info("  Пустой список путей — выход")
             return
         self._project_path = None
         imported = 0
         was_canceled = False
         new_file_paths: List[Path] = []
         use_headers_progress = self._load_mode != "preload_all"
+        log.info(f"  use_headers_progress={use_headers_progress}")
         progress = None
         if use_headers_progress:
             progress = self._create_progress_dialog("Импорт файлов", "Чтение заголовков...", len(filepaths), 0)
+            log.info(f"  Создан прогресс-диалог: maximum={len(filepaths)}")
         for i, file_path in enumerate(filepaths):
+            log.info(f"  --- Файл [{i}]: {file_path.name} ---")
             try:
                 if progress is not None:
                     progress.setLabelText(f"Чтение: {file_path.name}")
                     progress.setValue(i)
                     QtWidgets.QApplication.processEvents()
-                    if progress.wasCanceled():
+                    was_canceled_check = progress.wasCanceled()
+                    log.info(f"  progress.wasCanceled() [в цикле] = {was_canceled_check}")
+                    if was_canceled_check:
+                        log.warning("  >>> BREAK: progress.wasCanceled() == True в цикле!")
                         break
+                log.info(f"  Создаю провайдер для {file_path.name}...")
                 provider = make_series_provider(file_path)
+                log.info(f"  Провайдер: {type(provider).__name__}")
+                log.info(f"  Читаю list_series()...")
                 info = provider.list_series()
+                log.info(f"  x_name={info.x_name!r}, y_names={info.y_names}")
                 self._providers[file_path] = provider
 
                 series_list = []
@@ -944,31 +958,44 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._datasets.append({'path': file_path, 'series': series_list, 'x_name': info.x_name})
                 new_file_paths.append(file_path)
                 imported += len(info.y_names)
+                log.info(f"  imported={imported}, _load_mode={self._load_mode!r}")
                 if self._load_mode == "preload_all":
+                    log.info(f"  Вызываю _preload_provider_series для {file_path.name}...")
                     canceled = self._preload_provider_series(file_path, provider, series_list, None, 0)
+                    log.info(f"  _preload_provider_series вернул canceled={canceled}")
                     if canceled:
                         was_canceled = True
+                        log.warning("  >>> BREAK: preload вернул canceled=True!")
                         break
             except Exception as e:
+                log.error(f"  EXCEPTION при обработке {file_path.name}: {e}")
+                log.error(f"  {traceback.format_exc()}")
                 QtWidgets.QMessageBox.warning(self, "Ошибка", f"Не удалось загрузить файл\n{file_path}\n\n{e}")
         if progress is not None:
             progress.setValue(len(filepaths))
-            if progress.wasCanceled():
+            was_canceled_final = progress.wasCanceled()
+            log.info(f"  progress.wasCanceled() [после цикла] = {was_canceled_final}")
+            if was_canceled_final:
                 was_canceled = True
+                log.warning("  >>> was_canceled=True из-за progress.wasCanceled() после цикла!")
             progress.close()
 
+        log.info(f"  ИТОГО: was_canceled={was_canceled}, imported={imported}")
         if was_canceled:
+            log.warning("  >>> ROLLBACK + показываю 'Отмена'")
             self._rollback_new_imports(new_file_paths)
             QtWidgets.QMessageBox.information(self, "Отмена", "Импорт и предзагрузка отменены пользователем.")
             return
 
         if imported:
             self._project_dirty = True
+            log.info(f"  Успешно! Загружено рядов: {imported}")
             QtWidgets.QMessageBox.information(
                 self,
                 "Импорт завершён",
                 f"Загружено рядов: {imported}. Теперь вы можете добавить их через 'Добавить график…'"
             )
+        log.info("=== _load_data_from_paths END ===")
 
     def add_plot_dialog(self):
         # Подготовка списка доступных, ещё не добавленных рядов
@@ -1073,6 +1100,11 @@ class MainWindow(QtWidgets.QMainWindow):
         _was_canceled = [False]
 
         def on_finished(x_data, y_data, err):
+            # Отключаем canceled ПЕРЕД close(), чтобы Qt не эмитил ложную отмену
+            try:
+                progress_dlg.canceled.disconnect(on_cancel)
+            except (TypeError, RuntimeError):
+                pass
             progress_dlg.close()
             thread.quit()
             thread.wait()
@@ -1148,14 +1180,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plotted_keys.add(desc['key'])
         self._plot_index_to_source[idx_added] = (file_path, desc['name'])
         self._project_dirty = True
-        # путь к memmap для уже выгруженных на диск рядов
         try:
             import numpy as _np
             if isinstance(y_data, _np.memmap):
                 self._plot_tmp_paths[idx_added] = str(getattr(y_data, 'filename', ''))
         except Exception:
             pass
-        # ???????, ??? ???? ?????? ???????? ? RAM (????)
         self._memory_mru.append(idx_added)
         self._enforce_memory_limit()
         return idx_added
@@ -1170,8 +1200,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def clear_all(self):
         self.left.clear_all(); self.right.clear_all(); self.coords.clear_all()
-        # ?? ??????? ??????????????? ??????: ?? ????? ????????? ????????
-        # ?????? ????????? ????? ???????? Y
         for p in list(self._plot_tmp_paths.values()):
             try:
                 if Path(p).exists():
@@ -1206,30 +1234,24 @@ class MainWindow(QtWidgets.QMainWindow):
         current_range = self.right._x_half_range
         self.right.set_x_half_range(current_range * 1.5)
 
-    # --- memory management: demote older Y arrays to memmap when exceeding threshold ---
     def _enforce_memory_limit(self):
-        # ????????? ?????? ????????? self._max_memory_series ???????? ? RAM
         while len(self._memory_mru) > self._max_memory_series:
             idx_to_demote = self._memory_mru.pop(0)
             self._demote_plot_to_memmap(idx_to_demote)
 
     def _demote_plot_to_memmap(self, idx: int):
-        # ???? ??? ??????? ? ?????? ?? ??????
         if idx in self._plot_tmp_paths:
             return
         plot_data = self.right._plots.get(idx) if hasattr(self.right, "_plots") else None
         if not plot_data:
             return
-        # ????????? ???????? ?? ???? (??? ??????)
         pdialog = self._create_progress_dialog("Оптимизация памяти", "Перенос графика на диск...", 0, 0)
         QtWidgets.QApplication.processEvents()
         x_data = plot_data['x_data']
         y_data = plot_data['y_data']
         y_top = plot_data['y_top']; y_bottom = plot_data['y_bottom']
         color = plot_data['color']
-        # ????????? Y ? tmp ? ????????? ??? memmap
         try:
-            # ???? ??? memmap ? ?????? ?????? ?? ?????
             try:
                 import numpy as _np
                 if isinstance(y_data, _np.memmap):
@@ -1237,17 +1259,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     return
             except Exception:
                 pass
-            tmp = tempfile.NamedTemporaryFile(prefix=f"odiploma_y_{idx}_", suffix=".npy", delete=False)
+            tmp = tempfile.NamedTemporaryFile(prefix=f"secsig_y_{idx}_", suffix=".npy", delete=False)
             tmp_path = tmp.name
             tmp.close()
             np.save(tmp_path, np.asarray(y_data))
             y_mem = np.load(tmp_path, mmap_mode="r")
-            # ????????????????? ?????? ?? memmap
-            # ????????? ??????? min/max, ????? ?? ???????????
             y_min = float(plot_data.get('y_data_min', 0.0))
             y_max = float(plot_data.get('y_data_max', 1.0))
             self.right.add_or_update_plot(idx, x_data, y_mem, y_top, y_bottom, color, y_min=y_min, y_max=y_max)
-            # ????????? ???????????? ??????
             if idx in self.coords._sticks_data:
                 data = self.coords._sticks_data[idx]
                 self.coords.update_stick_data(idx, data['color'], data['data_min'], data['data_max'],
@@ -1255,7 +1274,6 @@ class MainWindow(QtWidgets.QMainWindow):
                                               name=data.get('name', ''))
             self._plot_tmp_paths[idx] = tmp_path
         except Exception as e:
-            # ???? ?? ???????, ?????????? idx ? ????? MRU (??????? ??? ?? ???????? ? RAM)
             self._memory_mru.append(idx)
         finally:
             pdialog.close()
@@ -1284,7 +1302,6 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             super().closeEvent(event)
 
-    # --- Настройки: режим загрузки (сохраняется в QSettings) ---
     def _show_load_mode_dialog(self):
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("Режим загрузки")
@@ -1346,7 +1363,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _preload_all_series(self):
-        # ???????????? ?? ?????? ? ????????? ?????????? ?? ?????? ????
         has_series = any(len(entry.get('series', [])) > 0 for entry in self._datasets)
         if not has_series:
             QtWidgets.QMessageBox.information(self, "Нет данных", "Сначала загрузите файлы.")
@@ -1377,14 +1393,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def on_finished(_canceled: bool):
             thread.quit()
-            event_loop.quit()
             if progress is None:
+                try:
+                    local_progress.canceled.disconnect(on_cancel)
+                except (TypeError, RuntimeError):
+                    pass
                 local_progress.close()
+            event_loop.quit()
 
         def on_cancel():
             _canceled_flag[0] = True
             worker.request_cancel()
-            # Немедленно закрываем диалог и прерываем ожидание — не ждём, пока поток дочитает.
             if progress is None:
                 local_progress.close()
             event_loop.quit()
@@ -1401,14 +1420,12 @@ class MainWindow(QtWidgets.QMainWindow):
         thread.start()
         event_loop.exec_()
 
-        return _canceled_flag[0] or worker._canceled
+        result = _canceled_flag[0] or worker._canceled
+        return result
 
     def _rollback_new_imports(self, file_paths: List[Path]):
-        # ??????? datasets ? ?????????? ??????????? ? ???? ???????
         paths_set = set(Path(p) for p in file_paths)
-        # remove datasets entries
         self._datasets = [d for d in self._datasets if Path(d.get('path')) not in paths_set]
-        # cleanup providers
         for p in list(paths_set):
             prov = self._providers.pop(p, None)
             if prov is not None:
@@ -1558,7 +1575,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mode_end_times = [float(t) for t in end_times]
         self._project_dirty = True
 
-    # --- Горизонтальный скролл-бар ---
     def _on_plot_x_range_changed(self, x_min: float, x_max: float, data_x_max: float):
         """Синхронизирует скролл-бар с текущим видимым диапазоном графика."""
         if self._x_scrollbar_updating:
@@ -1601,7 +1617,6 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._x_scrollbar_updating = False
 
-    # --- Settings ---
     def _load_user_settings(self):
         try:
             mode = str(self._settings.value("load_mode", "lazy"))
@@ -1766,7 +1781,6 @@ def _build_selection_tabs(
     """Строит QTabWidget с вкладками «Графики» и «Режимы»."""
     tabs = QtWidgets.QTabWidget()
 
-    # --- Вкладка «Графики» ---
     graphs_page = QtWidgets.QWidget()
     graphs_lay = QtWidgets.QVBoxLayout(graphs_page)
     btn_row = QtWidgets.QHBoxLayout()
@@ -1783,7 +1797,6 @@ def _build_selection_tabs(
     graphs_lay.addWidget(graph_list)
     tabs.addTab(graphs_page, "Графики")
 
-    # --- Вкладка «Режимы» ---
     modes_page = QtWidgets.QWidget()
     modes_lay = QtWidgets.QVBoxLayout(modes_page)
     btn_row_m = QtWidgets.QHBoxLayout()
@@ -1817,11 +1830,9 @@ class TensometryDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
 
-        # --- Вкладки: Графики / Режимы ---
         self._tabs, self._graph_list, self._mode_list = _build_selection_tabs(plots, modes)
         layout.addWidget(self._tabs)
 
-        # --- Параметры ---
         grp_params = QtWidgets.QGroupBox("Параметры")
         params_lay = QtWidgets.QHBoxLayout(grp_params)
         params_lay.addWidget(QtWidgets.QLabel("Показатель кривой Вёлера (m):"))
@@ -1830,7 +1841,6 @@ class TensometryDialog(QtWidgets.QDialog):
         params_lay.addWidget(self._miner_spin); params_lay.addStretch(1)
         layout.addWidget(grp_params)
 
-        # --- Рассчитать ---
         self._progress = QtWidgets.QProgressBar()
         self._progress.setRange(0, 100); self._progress.setValue(0); self._progress.setVisible(False)
         self._calc_btn = QtWidgets.QPushButton("Рассчитать и сохранить в xlsx")
@@ -1838,7 +1848,6 @@ class TensometryDialog(QtWidgets.QDialog):
         layout.addWidget(self._progress)
         layout.addWidget(self._calc_btn)
 
-    # --- расчёт ---
     def _run_calculation(self):
         main_win = self.parent()
         if not main_win or not hasattr(main_win, "get_plot_series_data"):
@@ -2117,15 +2126,12 @@ class VibrometryDialog(QtWidgets.QDialog):
 
         root = QtWidgets.QVBoxLayout(self)
 
-        # --- Вкладки: Графики / Режимы ---
         self._tabs, self._graph_list, self._mode_list = _build_selection_tabs(plots, modes)
         self._tabs.setMaximumHeight(200)
         root.addWidget(self._tabs)
 
-        # ============= Параметры: С.Ш.В. (лево) + Синусоидальная (право) =============
         params_row = QtWidgets.QHBoxLayout()
 
-        # ---------- Левый блок: С.Ш.В. ----------
         self._shv_cb = QtWidgets.QCheckBox("С. Ш. В.")
         self._shv_cb.setStyleSheet("font-weight: bold; font-size: 13px;")
         self._shv_cb.toggled.connect(self._on_shv_toggled)
@@ -2155,7 +2161,6 @@ class VibrometryDialog(QtWidgets.QDialog):
         left_box.addWidget(self._shv_frame)
         params_row.addLayout(left_box, 1)
 
-        # ---------- Правый блок: Синусоидальная вибрация ----------
         self._sin_cb = QtWidgets.QCheckBox("Синусоидальная вибрация")
         self._sin_cb.setStyleSheet("font-weight: bold; font-size: 13px;")
         self._sin_cb.toggled.connect(self._on_sin_toggled)
@@ -2222,7 +2227,6 @@ class VibrometryDialog(QtWidgets.QDialog):
         self._shv_frame.setEnabled(False)
         self._sin_frame.setEnabled(False)
 
-        # --- Расчёт ---
         self._progress = QtWidgets.QProgressBar()
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
@@ -2232,14 +2236,12 @@ class VibrometryDialog(QtWidgets.QDialog):
         root.addWidget(self._progress)
         root.addWidget(self._calc_btn)
 
-    # ---------- toggle helpers ----------
     def _on_shv_toggled(self, checked: bool):
         self._shv_frame.setEnabled(checked)
 
     def _on_sin_toggled(self, checked: bool):
         self._sin_frame.setEnabled(checked)
 
-    # ---------- validation ----------
     def _validate(self) -> bool:
         if not self._shv_cb.isChecked() and not self._sin_cb.isChecked():
             QtWidgets.QMessageBox.warning(self, "Ошибка",
@@ -2276,7 +2278,6 @@ class VibrometryDialog(QtWidgets.QDialog):
                 return False
         return True
 
-    # ---------- расчёт ----------
     def _run_calculation(self):
         main_win = self.parent()
         if not main_win or not hasattr(main_win, "get_plot_series_data"):
@@ -2374,7 +2375,6 @@ class VibrometryDialog(QtWidgets.QDialog):
             return
         self._export_xlsx()
 
-    # ---------- xlsx ----------
     def _export_xlsx(self):
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment
@@ -2392,7 +2392,6 @@ class VibrometryDialog(QtWidgets.QDialog):
         center = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
         # Собираем структуру столбцов по одному графику:
-        # --- С.Ш.В. ---
         bands = self._bands_list
         has_skz = self._calc_skz
         has_sxx = self._calc_sxx
@@ -2404,7 +2403,6 @@ class VibrometryDialog(QtWidgets.QDialog):
             if has_sxx:
                 n_shv_cols += n_bands
 
-        # --- Синусоидальная ---
         base_freqs = self._base_freqs_list
         has_equiv = self._calc_equiv
         has_eff = self._calc_eff
@@ -2424,7 +2422,6 @@ class VibrometryDialog(QtWidgets.QDialog):
         for g, m, r in self._results:
             data_map.setdefault(g, {})[m] = r
 
-        # ---- Заголовки (4 строки) ----
         # A1..A4: «№ реж.» (merge 4 rows)
         ws.merge_cells(start_row=1, start_column=1, end_row=4, end_column=1)
         c0 = ws.cell(1, 1, "№ реж.")
@@ -2446,7 +2443,6 @@ class VibrometryDialog(QtWidgets.QDialog):
 
             inner_col = g_start
 
-            # --- С.Ш.В. ---
             if self._calc_shv and n_shv_cols > 0:
                 shv_start = inner_col
                 shv_end = inner_col + n_shv_cols - 1
@@ -2489,7 +2485,6 @@ class VibrometryDialog(QtWidgets.QDialog):
                         c.alignment = center
                     inner_col += n_bands
 
-            # --- Синусоидальная вибрация ---
             if self._calc_sin and n_sin_cols > 0:
                 sin_start = inner_col
                 sin_end = inner_col + n_sin_cols - 1
@@ -2527,7 +2522,6 @@ class VibrometryDialog(QtWidgets.QDialog):
 
             col += n_cols_per_graph
 
-        # ---- Данные ----
         DATA_START_ROW = 5
         for ri, mode_label in enumerate(modes):
             row = DATA_START_ROW + ri

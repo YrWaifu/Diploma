@@ -362,7 +362,7 @@ class DataPlot(pg.PlotWidget):
     sigCursorMoved = QtCore.pyqtSignal(float, int)  # x_value, y_pixel
 
     def __init__(self, parent=None):
-        # 1) ВАЖНО: состояние — ДО super().__init__()
+        # состояние до super().__init__()
         self.vb = XZoomViewBox()
         self._curves = {}  # idx -> PlotDataItem
         self._plots = {}  # idx -> dict(x_data, y_data, y_top, y_bottom, color)
@@ -653,7 +653,7 @@ class CoordinatesPanel(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ODiploma — правая панель на pyqtgraph, всё быстро и по делу")
+        self.setWindowTitle("SecSig — правая панель на pyqtgraph")
         self.resize(1400, 700)
 
         central = QtWidgets.QWidget()

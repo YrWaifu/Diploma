@@ -310,7 +310,7 @@ class DataPlot(pg.PlotWidget):
         pad_right = span * float(padding_ratio)
         self.set_x_range_direct(0.0, xmax + pad_right)
 
-    # --- режимный график / маркеры ---
+    # Режимные линии и маркеры
     def clear_mode_markers(self):
         """Удаляет все вертикальные линии и области, связанные с режимами."""
         for ln in self._mode_lines_start:
@@ -460,7 +460,7 @@ class DataPlot(pg.PlotWidget):
         except Exception:
             return
 
-    # --- подписи графиков справа ---
+    # Подписи справа от графика
     def set_plot_label(self, idx: int, text: str, color) -> None:
         """Создаёт или обновляет подпись графика вдоль шкалы справа."""
         if idx not in self._plots:

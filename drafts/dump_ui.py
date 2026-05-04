@@ -73,7 +73,7 @@ def build_ui_skeleton(win: MainWindow) -> Element:
 
     # geometry + title
     rect(mw, "geometry", 0, 0, max(800, win.width()), max(600, win.height()))
-    prop(mw, "windowTitle", "string", win.windowTitle() or "ODiploma")
+    prop(mw, "windowTitle", "string", win.windowTitle() or "SecSig")
 
     # central widget with HBox and three placeholders
     central = SubElement(mw, "widget", **{"class": "QWidget", "name": "centralwidget"})
@@ -89,7 +89,7 @@ def build_ui_skeleton(win: MainWindow) -> Element:
     add_placeholder(hbox, "plotPlaceholder")
     add_placeholder(hbox, "coordsPlaceholder")
 
-    # ВАЖНО: stretch задаётся на сам QHBoxLayout одной строкой
+    # stretch задаётся на QHBoxLayout одной строкой
     prop(hbox, "stretch", "string", "1,4,1")
 
     # ToolBar

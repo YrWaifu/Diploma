@@ -5,9 +5,13 @@ from typing import List, Tuple, Optional
 import gc
 import os
 import tempfile
+import logging
+import traceback
 
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger("secsig")
 
 
 @dataclass
@@ -39,19 +43,16 @@ class BaseSeriesProvider:
             self.list_series()
         if y_name not in self._series_names:
             raise ValueError(f"Unknown series: {y_name}")
-        # ensure X memmap is prepared
         x_arr = self.ensure_x_loaded()
         y_arr = self.load_y(y_name)
         return x_arr, y_arr
 
-    # Optional progress callbacks: progress(current: int, total: int, label: str) -> None
     def ensure_x_loaded(self, progress=None, total_hint: Optional[int] = None) -> np.ndarray:
         return self._ensure_x_memmap()
 
     def load_y(self, y_name: str, progress=None, total_hint: Optional[int] = None) -> np.ndarray:
         return self._read_y_column(y_name)
 
-    # Hints for UI/logic
     def is_x_cached(self) -> bool:
         return self._x_memmap is not None
 
@@ -66,7 +67,7 @@ class BaseSeriesProvider:
 
     def cleanup(self):
         try:
-            # Сбрасываем ссылки на memmap, чтобы ОС освободила файлы (на Windows иначе PermissionError при удалении)
+            # Drop mmap refs so Windows can delete temp files (avoid PermissionError).
             self._x_memmap = None
             self._y_memmaps.clear()
             gc.collect()
@@ -93,7 +94,6 @@ class BaseSeriesProvider:
             self._x_memmap_path = None
             self._tmpdir = None
 
-    # --- abstract-ish methods ---
     def _read_header(self) -> Tuple[str, List[str]]:
         raise NotImplementedError
 
@@ -103,10 +103,9 @@ class BaseSeriesProvider:
     def _read_y_column(self, y_name: str) -> np.ndarray:
         raise NotImplementedError
 
-    # --- helpers ---
     def _ensure_tmpdir(self) -> str:
         if self._tmpdir is None:
-            self._tmpdir = tempfile.TemporaryDirectory(prefix="odiploma_")
+            self._tmpdir = tempfile.TemporaryDirectory(prefix="secsig_")
         return self._tmpdir.name
 
     def _ensure_x_memmap(self) -> np.memmap:
@@ -115,7 +114,6 @@ class BaseSeriesProvider:
         x_arr = self._read_x_column()
         tmpdir = self._ensure_tmpdir()
         x_path = os.path.join(tmpdir, "x.npy")
-        # save and reopen as memmap
         np.save(x_path, x_arr)
         self._x_memmap_path = x_path
         self._x_memmap = np.load(x_path, mmap_mode="r")
@@ -128,25 +126,29 @@ class CSVSeriesProvider(BaseSeriesProvider):
         self.sep = sep
         self.decimal = decimal
         self._encoding: Optional[str] = None
-        # порядок проб для русскоязычных CSV
         self._encodings_try: List[str] = ["utf-8", "utf-8-sig", "cp1251", "windows-1251", "koi8-r", "iso-8859-1"]
         self._cancel_requested: bool = False
 
     def request_cancel(self):
         self._cancel_requested = True
 
-    # --- streaming helpers for huge CSV ---
     def estimate_rows(self, col_name: Optional[str] = None, chunksize: int = 1_000_000) -> int:
         if self._encoding is None or self._x_name is None:
             self._resolve_read_params()
         enc = self._encoding or "utf-8"
         name = (col_name if col_name is not None else self._x_name) or 0
+        log.debug("CSV estimate_rows col=%r enc=%r chunksize=%s", name, enc, chunksize)
         total = 0
-        for chunk in pd.read_csv(self.path, usecols=[name], sep=None, engine="python",
-                                 encoding=enc, chunksize=chunksize, dtype=str):
-            if self._cancel_requested:
-                raise InterruptedError("Canceled by user")
-            total += len(chunk)
+        try:
+            for chunk in pd.read_csv(self.path, usecols=[name], sep=None, engine="python",
+                                     encoding=enc, chunksize=chunksize, dtype=str):
+                if self._cancel_requested:
+                    raise InterruptedError("Canceled by user")
+                total += len(chunk)
+        except Exception as e:
+            log.error("CSV estimate_rows: %s\n%s", e, traceback.format_exc())
+            raise
+        log.debug("CSV estimate_rows = %s", total)
         return total
 
     def _stream_column_to_memmap(self, col_name: str, chunksize: int = 500_000, progress=None,
@@ -154,7 +156,6 @@ class CSVSeriesProvider(BaseSeriesProvider):
         if self._encoding is None or self._x_name is None:
             self._resolve_read_params()
         enc = self._encoding or "utf-8"
-        # pass 1: count rows (if not hinted)
         total = int(total_rows) if total_rows is not None else 0
         if total == 0:
             for chunk in pd.read_csv(self.path, usecols=[col_name], sep=None, engine="python",
@@ -162,11 +163,9 @@ class CSVSeriesProvider(BaseSeriesProvider):
                 if self._cancel_requested:
                     raise InterruptedError("Canceled by user")
                 total += len(chunk)
-        # allocate memmap
         tmpdir = self._ensure_tmpdir()
-        safe_col = str(col_name).replace(os.sep, "_")
+        safe_col = str(col_name).replace(os.sep, "_").replace("/", "_").replace("\\", "_").replace(":", "_")
         out_path = os.path.join(tmpdir, f"{self.path.stem}_{safe_col}.dat")
-        # reuse if exists and size matches
         if os.path.exists(out_path):
             try:
                 mm_r = np.memmap(out_path, dtype="float64", mode="r", shape=(total,))
@@ -177,7 +176,6 @@ class CSVSeriesProvider(BaseSeriesProvider):
                 except Exception:
                     pass
         mm = np.memmap(out_path, dtype="float64", mode="w+", shape=(total,))
-        # pass 2: fill memmap
         offset = 0
         has_minmax = False
         cur_min = np.inf
@@ -201,7 +199,6 @@ class CSVSeriesProvider(BaseSeriesProvider):
                     progress(offset, total, f"{col_name}")
                 except Exception:
                     pass
-            # update min/max без предупреждений на "все NaN"
             if n > 0:
                 valid = np.isfinite(arr)
                 if np.any(valid):
@@ -235,7 +232,6 @@ class CSVSeriesProvider(BaseSeriesProvider):
         return self._x_memmap
 
     def load_y(self, y_name: str, progress=None, total_hint: Optional[int] = None) -> np.ndarray:
-        # всегда возвращаем memmap, чтобы не распухала RAM
         if y_name in self._y_memmaps:
             return self._y_memmaps[y_name]
         total = int(total_hint) if total_hint else (len(self._x_memmap) if self._x_memmap is not None else 0)
@@ -252,20 +248,25 @@ class CSVSeriesProvider(BaseSeriesProvider):
     def _resolve_read_params(self):
         if self._encoding is not None and self._x_name is not None and self._series_names is not None:
             return
+        log.debug("CSV _resolve_read_params path=%s", self.path)
         last_err: Optional[Exception] = None
         for enc in self._encodings_try:
             try:
-                # определяем заголовок, позволяем парсеру сам найти разделитель
+                log.debug("CSV пробую encoding=%r", enc)
                 df = pd.read_csv(self.path, nrows=0, sep=None, engine="python", encoding=enc)
                 cols = list(df.columns)
+                log.debug("CSV encoding=%r cols=%s", enc, cols)
                 if len(cols) < 2:
-                    raise ValueError("CSV must contain at least 2 columns (X and one Y)")
+                    raise ValueError(f"CSV must contain at least 2 columns (X and one Y), got {len(cols)}: {cols}")
                 self._encoding = enc
                 self._x_name = str(cols[0])
                 self._series_names = [str(c) for c in cols[1:]]
+                log.debug("CSV ok x=%r series=%s", self._x_name, self._series_names)
                 return
             except Exception as e:
+                log.debug("CSV encoding=%r ошибка: %s", enc, e)
                 last_err = e
+        log.error("CSV: не удалось определить кодировку: %s", last_err)
         raise last_err if last_err else RuntimeError("Failed to detect CSV encoding")
 
     def _read_header(self) -> Tuple[str, List[str]]:
@@ -273,7 +274,6 @@ class CSVSeriesProvider(BaseSeriesProvider):
         return self._x_name or "", list(self._series_names or [])
 
     def _read_x_column(self) -> np.ndarray:
-        # не используем для больших CSV; оставлено для совместимости
         if self._x_name is None or self._encoding is None:
             self._resolve_read_params()
         name = self._x_name or 0
@@ -282,7 +282,6 @@ class CSVSeriesProvider(BaseSeriesProvider):
         return df.iloc[:, 0].to_numpy()
 
     def _read_y_column(self, y_name: str) -> np.ndarray:
-        # не используется: см. load_y (стриминг в memmap)
         if self._encoding is None:
             self._resolve_read_params()
         enc = self._encoding or "utf-8"
@@ -311,13 +310,11 @@ class XLSXSeriesProvider(BaseSeriesProvider):
 
 class ParquetSeriesProvider(BaseSeriesProvider):
     def _read_header(self) -> Tuple[str, List[str]]:
-        # Try pyarrow for cheap schema read
         try:
             import pyarrow.parquet as pq  # type: ignore
             pf = pq.ParquetFile(self.path)
             cols = list(pf.schema.names)
         except Exception:
-            # Fallback (may be heavy): read minimal DataFrame to get columns
             df = pd.read_parquet(self.path)
             cols = list(df.columns)
             del df

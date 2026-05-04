@@ -1,18 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Тесты модуля виброметрии (app.processing.vibrometry).
-Запуск: из корня проекта выполнить  pytest tests/
-
-Покрывает:
-  - estimate_fs_from_time
-  - compute_time_characteristics (пустой, константа, синус)
-  - psd_welch (форма, разрешение, граничные случаи)
-  - rms_in_band_from_psd
-  - compute_vibrometry (legacy-API)
-  - compute_bands (С.Ш.В.: СКЗ + Sxx по полосам)
-  - compute_sinusoidal (синусоидальная вибрация: экв./эфф. амплитуда)
-  - compute_full_vibrometry (комплексный)
-  - Тесты на реальном CSV с тремя режимами (Р-1, Р-2, Р-3)
+Тесты app.processing.vibrometry.
 """
 from __future__ import annotations
 
@@ -42,10 +30,7 @@ from app.processing.vibrometry import (
 from .conftest import FS, ACTIVE_MODES
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  1. estimate_fs_from_time
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestEstimateFs:
     def test_uniform_grid(self):
         t = np.linspace(0, 1, 1001)  # Δt = 0.001, fs = 1000
@@ -66,10 +51,7 @@ class TestEstimateFs:
         assert abs(fs - FS) < 1.0  # должно быть ≈ 2000 Гц
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  2. compute_time_characteristics
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestTimeCharacteristics:
     def test_empty(self):
         r = compute_time_characteristics(np.array([]))
@@ -100,10 +82,7 @@ class TestTimeCharacteristics:
         assert rms_vals["Р-1"] < rms_vals["Р-2"] < rms_vals["Р-3"]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  3. psd_welch
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestPsdWelch:
     def test_shape_and_resolution(self):
         np.random.seed(42)
@@ -140,10 +119,7 @@ class TestPsdWelch:
         assert abs(peak_f - 16.0) < 3.0  # основной тон 16 Гц
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  4. rms_in_band_from_psd
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestRmsInBand:
     def test_pure_tone(self):
         """СКЗ в полосе для чистого тона 50 Гц ≈ A/√2."""
@@ -169,10 +145,7 @@ class TestRmsInBand:
         assert np.isnan(rms_in_band_from_psd(np.array([]), np.array([]), 0, 100, 1000, 256))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  5. compute_vibrometry (legacy)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestComputeVibrometry:
     def test_full(self):
         fs = 1000.0
@@ -195,10 +168,7 @@ class TestComputeVibrometry:
         assert r.n_samples == 0 and np.isnan(r.time.mean)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  6. compute_bands (С.Ш.В.)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestComputeBands:
     def test_single_tone_in_band(self):
         """Тон 50 Гц: полоса 10–100 содержит почти всю энергию, 200–400 — нет."""
@@ -242,10 +212,7 @@ class TestComputeBands:
         assert vals["Р-1"] < vals["Р-2"] < vals["Р-3"]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  7. compute_sinusoidal (синусоидальная вибрация)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestComputeSinusoidal:
     def test_pure_tone_equiv(self):
         """Чистый тон 50 Гц → экв. амплитуда ≈ A (A = 1)."""
@@ -317,10 +284,7 @@ class TestComputeSinusoidal:
         assert vals["Р-1"] < vals["Р-2"] < vals["Р-3"]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  8. compute_full_vibrometry (комплексный тест)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestFullVibrometry:
     def test_bands_only(self):
         fs = 1000.0
@@ -374,10 +338,7 @@ class TestFullVibrometry:
             assert r.sinusoidal[0].equiv_amplitude is not None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  9. Тест на CSV-файл (чтение + расчёт)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestCsvIntegration:
     def test_read_csv_and_compute(self, test_csv_path):
         """Читаем CSV, нарезаем по режимам, считаем полную виброметрию."""

@@ -3,9 +3,9 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "odiploma"
+name = "secsig"
 version = "0.1.0"
-description = "ODiploma demo app split by layers"
+description = "SecSig — PyQt-приложение для анализа временных рядов (тензометрия и вибрации)"
 authors = [{name = "You"}]
 requires-python = ">=3.10"
 dependencies = [
@@ -17,5 +17,5 @@ dependencies = [
   "pyarrow>=12",
 ]
 
-[tool.odiploma]
+[tool.secsig]
 entrypoint = "app.app:main"
